@@ -24,6 +24,7 @@ log = "0.4"
 libsecp256k1 = "0.2.1"
 tiny-keccak = "1.4.2"
 sharedlib = "7.0.0"
+libc = "0.2.48"
 
 [dev-dependencies]
 assert_matches = "1.1"

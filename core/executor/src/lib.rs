@@ -27,6 +27,9 @@
 
 #![warn(missing_docs)]
 #![recursion_limit="128"]
+#![feature(inner_deref)]
+
+extern crate libc;
 
 extern crate sharedlib;
 

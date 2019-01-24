@@ -62,6 +62,17 @@ lazy_static! {
 unsafe impl Send for FunctionExecutor{}
 unsafe impl Sync for FunctionExecutor{}
 
+#[link(name = "node_runtime")]
+#[link(name = "substrate_test_runtime")]
+#[link(name = "runtime_test")]
+
+extern {
+	//fn Z_test_blake2_256Z_jii(input: libc::c_int) -> libc::c_int;
+	fn Z_test_blake2_256Z_jii(offset: libc::uint32_t, size: libc::uint32_t) -> libc::uint64_t;
+	//fn Z_test_blake2_256Z_jii(offset: u32, size: u32) -> u64;
+    //  24   │ typedef uint32_t u32; 26   │ typedef uint64_t u64;
+}
+
 struct FunctionExecutor {
 	sandbox_store: sandbox::Store,
 	heap: allocator::FreeingBumpHeapAllocator,
@@ -639,20 +650,64 @@ impl_function_executor!(this: FunctionExecutor,
 	=> <>
 );
 
-#[link(name = "libsubstrate_test_runtime")]
-#[no_mangle] extern "C" fn Z_envZ_ext_storage_changes_rootZ_iiiji(parent_hash_data: *const u8, parent_hash_len: u32, parent_number: u64, result: *mut u8) -> u32 {
-    /*
+/*
+ext_storage_changes_root(parent_hash_data: *const u8, parent_hash_len: u32, parent_number: u64, result: *mut u8) -> u32 => {
+//Z_envZ_ext_storage_changes_rootZ_iiiji(parent_hash_data: *const u8, parent_hash_len: u32, parent_number: u64, result: *mut u8) -> u32 => {
+    let mut parent_hash = H256::default();
+    if parent_hash_len != parent_hash.as_ref().len() as u32 {
+        return Err(UserError("Invalid parent_hash_len in ext_storage_changes_root").into());
+    }
+    let raw_parent_hash = this.memory.get(parent_hash_data, parent_hash_len as usize)
+        .map_err(|_| UserError("Invalid attempt to get parent_hash in ext_storage_changes_root"))?;
+    parent_hash.as_mut().copy_from_slice(&raw_parent_hash[..]);
+    let r = this.ext.storage_changes_root(parent_hash, parent_number);
+    if let Some(ref r) = r {
+        this.memory.set(result, &r[..]).map_err(|_| UserError("Invalid attempt to set memory in ext_storage_changes_root"))?;
+    }
+    Ok(if r.is_some() { 1u32 } else { 0u32 })
+},
+*/
+//#[no_mangle] extern "C" fn Z_envZ_ext_storage_changes_rootZ_iiiji(parent_hash_data: *const u8, parent_hash_len: u32, parent_number: u64, result: *mut u8) -> u32 {
+#[no_mangle] extern "C" fn Z_envZ_ext_storage_changes_rootZ_iiiji(parent_hash_data: u32, parent_hash_len: u32, parent_number: u64, result: u32) -> u32 {
+    //let parent_hash_data = *(parent_hash_data as u8);
+    //let result = (result as u8);
+
     let mut parent_hash = H256::default();
     if parent_hash_len != parent_hash.as_ref().len() as u32 {
         //return Err(UserError("Invalid parent_hash_len in ext_storage_changes_root").into());
         return 0;
     }
-    let raw_parent_hash = thisFE.lock().unwrap().unwrap().memory.get((*parent_hash_data).into(), parent_hash_len as usize);
+
+    //let unwrap_mutex: Option<&'static mut FunctionExecutor> = thisFE.get_mut().unwrap();
+    //let unwrap_mutex: Option<&'static mut FunctionExecutor> = thisFE.lock().unwrap().deref();
+    let unwrap_mutex = thisFE.lock().unwrap();
+    let foo = unwrap_mutex.deref();
+    let fec = foo.unwrap();
+
+    //let fec = thisFE.lock().unwrap().clone().unwrap();
+
+    /*
+    //let () = thisFE.lock();
+    //let () = thisFE.lock().unwrap();
+
+    //let memory = &thisFE.lock().unwrap().as_ref().unwrap().memory;
+    //let fec: &&mut FunctionExecutor = thisFE.lock().unwrap().as_ref().unwrap();
+    //
+    //let () = foo;
+    //let bar = foo.as_ref().unwrap();
+    //let () = bar;
+    //let fec: &mut FunctionExecutor = &mut *bar;
+
+    let memory = &fec.memory;
+    let ext = &fec.ext;
+
+    //let ext = &thisFE.lock().unwrap().as_ref().unwrap().ext;
+    let raw_parent_hash = (*memory).get(parent_hash_data, parent_hash_len as usize).unwrap();
         //.map_err(|_| UserError("Invalid attempt to get parent_hash in ext_storage_changes_root"))?;
     parent_hash.as_mut().copy_from_slice(&raw_parent_hash[..]);
-    let r = thisFE.lock().unwrap().unwrap().ext.storage_changes_root(parent_hash, parent_number);
+    let r = ext.storage_changes_root(parent_hash, parent_number);
     if let Some(ref r) = r {
-        thisFE.lock().unwrap().unwrap().memory.set(*result, &r[..]);
+        thisFE.lock().unwrap().unwrap().memory.set(result, &r[..]);
         //.map_err(|_| UserError("Invalid attempt to set memory in ext_storage_changes_root"))?;
     }
     if r.is_some() { 1u32 } else { 0u32 }
@@ -753,9 +808,11 @@ impl WasmExecutor {
         */
         //let result: Result<Option<i64>, i64> = Ok(Some(I64(result as i64)));
 
-        let result = match method {
-            test_blake2_256 => test_blake2_256(offset as i32, size as i32)
-        };
+		let result = match method {
+			//"test_blake2_256" => unsafe { Z_test_blake2_256Z_jii(offset as i32, size as i32) },
+			"test_blake2_256" => unsafe { Z_test_blake2_256Z_jii(offset as u32, size as u32) },
+			&_ => 0,
+		};
 
         eprintln!("result: {:?}", result);
 

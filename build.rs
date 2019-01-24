@@ -22,5 +22,10 @@ const ERROR_MSG: &'static str = "Failed to generate metadata files";
 
 fn main() {
 	generate_cargo_keys(ConstantsFlags::all()).expect(ERROR_MSG);
+
+	println!("cargo:rustc-link-lib=node_runtime");
+	println!("cargo:rustc-link-lib=runtime_test");
+	println!("cargo:rustc-link-lib=substrate_test_runtime");
+
 	println!("cargo:rerun-if-changed=.git/HEAD");
 }
