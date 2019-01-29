@@ -46,29 +46,43 @@ macro_rules! debug_trace {
 	( $( $x:tt )* ) => ()
 }
 
-struct FunctionExecutor<'e, E: Externalities<Blake2Hasher> + 'e> {
+use std::sync::Mutex;
+use std::sync::Arc;
+lazy_static! {
+    static ref thisFE: Mutex<
+        Option<
+                &'static mut FunctionExecutor
+        >
+    > = Default::default();
+}
+
+unsafe impl Send for FunctionExecutor{}
+unsafe impl Sync for FunctionExecutor{}
+
+struct FunctionExecutor {
 	sandbox_store: sandbox::Store,
 	heap: allocator::FreeingBumpHeapAllocator,
 	memory: MemoryRef,
 	table: Option<TableRef>,
-	ext: &'e mut E,
+	ext: &'static mut Externalities<Blake2Hasher>,
 	hash_lookup: HashMap<Vec<u8>, Vec<u8>>,
 }
 
-impl<'e, E: Externalities<Blake2Hasher>> FunctionExecutor<'e, E> {
-	fn new(m: MemoryRef, t: Option<TableRef>, e: &'e mut E) -> Result<Self> {
+use std::mem;
+impl FunctionExecutor {
+	fn new<'e, E: Externalities<Blake2Hasher>>(m: MemoryRef, t: Option<TableRef>, e: &'e mut E) -> Result<Self> {
 		Ok(FunctionExecutor {
 			sandbox_store: sandbox::Store::new(),
 			heap: allocator::FreeingBumpHeapAllocator::new(m.clone()),
 			memory: m,
 			table: t,
-			ext: e,
+			ext: unsafe { mem::transmute(e as &mut Externalities<Blake2Hasher>) },
 			hash_lookup: HashMap::new(),
-		})
+		}
 	}
 }
 
-impl<'e, E: Externalities<Blake2Hasher>> sandbox::SandboxCapabilities for FunctionExecutor<'e, E> {
+impl sandbox::SandboxCapabilities for FunctionExecutor {
 	fn store(&self) -> &sandbox::Store {
 		&self.sandbox_store
 	}
@@ -113,7 +127,8 @@ impl ReadPrimitive<u32> for MemoryInstance {
 	}
 }
 
-impl_function_executor!(this: FunctionExecutor<'e, E>,
+// TODO: this macro does not support `where` clauses and that seems somewhat tricky to add
+impl_function_executor!(this: FunctionExecutor,
 	ext_print_utf8(utf8_data: *const u8, utf8_len: u32) => {
 		if let Ok(utf8) = this.memory.get(utf8_data, utf8_len as usize) {
 			if let Ok(message) = String::from_utf8(utf8) {
@@ -617,7 +632,7 @@ impl_function_executor!(this: FunctionExecutor<'e, E>,
 		this.sandbox_store.memory_teardown(memory_idx)?;
 		Ok(())
 	},
-	=> <'e, E: Externalities<Blake2Hasher> + 'e>
+	=> <>
 );
 
 /// Wasm rust executor for contracts.
@@ -680,6 +695,13 @@ impl WasmExecutor {
 		let offset = fec.heap.allocate(size);
 		memory.set(offset, &data)?;
 
+        /*
+        let arc_ref = &mut fec;
+        *thisFE.lock().unwrap() = Some(unsafe { mem::transmute(arc_ref) });
+        let result = call_in_so(method, I32(offset as i32), I32(size as i32));
+        let result = Ok(Some(result));
+        */
+
 		let result = module_instance.invoke_export(
 			method,
 			&[
@@ -688,6 +710,7 @@ impl WasmExecutor {
 			],
 			&mut fec
 		);
+
 		let result = match result {
 			Ok(Some(I64(r))) => {
 				let offset = r as u32;
@@ -724,7 +747,7 @@ impl WasmExecutor {
 		let intermediate_instance = ModuleInstance::new(
 			module,
 			&ImportsBuilder::new()
-			.with_resolver("env", FunctionExecutor::<E>::resolver())
+			.with_resolver("env", FunctionExecutor::resolver())
 			)?;
 
 		// extract a reference to a linear memory, optional reference to a table
