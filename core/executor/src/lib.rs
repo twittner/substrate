@@ -28,6 +28,8 @@
 #![warn(missing_docs)]
 #![recursion_limit="128"]
 
+extern crate sharedlib;
+
 #[macro_use]
 extern crate lazy_static;
 
