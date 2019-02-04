@@ -538,7 +538,7 @@ impl_function_executor!(this: FunctionExecutor,
 		let dispatch_thunk = {
 			let table = this.table.as_ref()
 				.ok_or_else(|| UserError("Runtime doesn't have a table; sandbox is unavailable"))?;
-			table.get(dispatch_thunk_idx)
+			(*table).get(dispatch_thunk_idx)
 				.map_err(|_| UserError("dispatch_thunk_idx is out of the table bounds"))?
 				.ok_or_else(|| UserError("dispatch_thunk_idx points on an empty table entry"))?
 				.clone()
