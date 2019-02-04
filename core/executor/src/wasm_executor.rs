@@ -79,7 +79,7 @@ impl FunctionExecutor {
 			table: t,
 			ext: unsafe { mem::transmute(e as &mut Externalities<Blake2Hasher>) },
 			hash_lookup: HashMap::new(),
-		}
+		})
 	}
 }
 
@@ -674,6 +674,7 @@ impl WasmExecutor {
 			.clone())
 	}
 
+            /*
 	pub fn invoke_in_so(&self, method: &str, offset: i32, size: i32) -> i64 {
         unsafe {
             let path_to_lib = "libbar.so";
@@ -689,6 +690,7 @@ impl WasmExecutor {
             */
         }
     }
+    */
 
 	/// Call a given method in the given wasm-module runtime.
 	pub fn call_in_wasm_module<E: Externalities<Blake2Hasher>>(
@@ -714,15 +716,16 @@ impl WasmExecutor {
 
         let arc_ref = &mut fec;
         *thisFE.lock().unwrap() = Some(unsafe { mem::transmute(arc_ref) });
-        let result = self.invoke_in_so(method, offset as i32, size as i32);
+        //let result = self.invoke_in_so(method, offset as i32, size as i32);
         //let result: Result<<Option<i64>, i64> = Ok(Some(I64(result as i64)));
 
+        /*
         let r = result as u32;
         let offset = r as u32;
         let length = (r >> 32) as u32 as usize;
         let result = memory.get(offset, length).map_err(|_| ErrorKind::Runtime.into());
+        */
 
-        /*
 		let result = module_instance.invoke_export(
 			method,
 			&[
@@ -731,9 +734,7 @@ impl WasmExecutor {
 			],
 			&mut fec
 		);
-        */
 
-        /*
 		let result = match result {
 			Ok(Some(I64(r))) => {
 				let offset = r as u32;
@@ -742,14 +743,11 @@ impl WasmExecutor {
 					.map_err(|_| ErrorKind::Runtime.into())
 			},
 			Ok(_) => Err(ErrorKind::InvalidReturn.into()),
-            /*
 			Err(e) => {
 				trace!(target: "wasm-executor", "Failed to execute code with {} pages", memory.current_size().0);
 				Err(e.into())
 			},
-            */
 		};
-        */
 
 		// cleanup module instance for next use
 		let new_low = memory.lowest_used();
