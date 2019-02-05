@@ -747,8 +747,15 @@ impl WasmExecutor {
 
         let arc_ref = &mut fec;
         *thisFE.lock().unwrap() = Some(unsafe { mem::transmute(arc_ref) });
+
+        /*
         let result = self.invoke_in_so(method, offset as i32, size as i32);
+        */
         //let result: Result<Option<i64>, i64> = Ok(Some(I64(result as i64)));
+
+        let result = match method {
+            test_blake2_256 => test_blake2_256(offset as i32, size as i32)
+        };
 
         eprintln!("result: {:?}", result);
 
