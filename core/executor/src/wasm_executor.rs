@@ -17,6 +17,8 @@
 //! Rust implementation of Substrate contracts.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+
 use tiny_keccak;
 use secp256k1;
 
@@ -401,6 +403,7 @@ impl_function_executor!(this: FunctionExecutor,
 		}
 	},
 	ext_storage_changes_root(parent_hash_data: *const u8, parent_hash_len: u32, parent_number: u64, result: *mut u8) -> u32 => {
+	//Z_envZ_ext_storage_changes_rootZ_iiiji(parent_hash_data: *const u8, parent_hash_len: u32, parent_number: u64, result: *mut u8) -> u32 => {
 		let mut parent_hash = H256::default();
 		if parent_hash_len != parent_hash.as_ref().len() as u32 {
 			return Err(UserError("Invalid parent_hash_len in ext_storage_changes_root").into());
@@ -636,6 +639,28 @@ impl_function_executor!(this: FunctionExecutor,
 	=> <>
 );
 
+#[link(name = "libsubstrate_test_runtime")]
+#[no_mangle] extern "C" fn Z_envZ_ext_storage_changes_rootZ_iiiji(parent_hash_data: *const u8, parent_hash_len: u32, parent_number: u64, result: *mut u8) -> u32 {
+    /*
+    let mut parent_hash = H256::default();
+    if parent_hash_len != parent_hash.as_ref().len() as u32 {
+        //return Err(UserError("Invalid parent_hash_len in ext_storage_changes_root").into());
+        return 0;
+    }
+    let raw_parent_hash = thisFE.lock().unwrap().unwrap().memory.get((*parent_hash_data).into(), parent_hash_len as usize);
+        //.map_err(|_| UserError("Invalid attempt to get parent_hash in ext_storage_changes_root"))?;
+    parent_hash.as_mut().copy_from_slice(&raw_parent_hash[..]);
+    let r = thisFE.lock().unwrap().unwrap().ext.storage_changes_root(parent_hash, parent_number);
+    if let Some(ref r) = r {
+        thisFE.lock().unwrap().unwrap().memory.set(*result, &r[..]);
+        //.map_err(|_| UserError("Invalid attempt to set memory in ext_storage_changes_root"))?;
+    }
+    if r.is_some() { 1u32 } else { 0u32 }
+    //Ok(if r.is_some() { 1u32 } else { 0u32 })
+    */
+    1u32
+}
+
 /// Wasm rust executor for contracts.
 ///
 /// Executes the provided code in a sandboxed wasm runtime.
@@ -674,12 +699,17 @@ impl WasmExecutor {
 			.clone())
 	}
 
-            /*
 	pub fn invoke_in_so(&self, method: &str, offset: i32, size: i32) -> i64 {
+        // libnode_runtime.so  libruntime_test.so  libsubstrate_test_runtime.so
         unsafe {
-            let path_to_lib = "libbar.so";
-            let lib = Lib::new(path_to_lib).unwrap();
-            let hello_world_symbol: Func<extern "C" fn()> = lib.find_func(method).unwrap();
+            //let path_to_lib = "libbar.so";
+            let path_to_lib = "libruntime_test.so";
+            //let lib = Lib::new(path_to_lib).unwrap();
+
+            let libpath = PathBuf::from(format!("{}", path_to_lib));
+            let lib = Lib::new(libpath).unwrap();
+
+            let hello_world_symbol: Func<extern "C" fn() -> i64> = lib.find_func(method).unwrap();
             let hello_world = hello_world_symbol.get();
             hello_world()
 
@@ -690,7 +720,6 @@ impl WasmExecutor {
             */
         }
     }
-    */
 
 	/// Call a given method in the given wasm-module runtime.
 	pub fn call_in_wasm_module<E: Externalities<Blake2Hasher>>(
@@ -714,18 +743,21 @@ impl WasmExecutor {
 		let offset = fec.heap.allocate(size);
 		memory.set(offset, &data)?;
 
+        eprintln!("trying to call method: {:?}", method);
+
         let arc_ref = &mut fec;
         *thisFE.lock().unwrap() = Some(unsafe { mem::transmute(arc_ref) });
-        //let result = self.invoke_in_so(method, offset as i32, size as i32);
-        //let result: Result<<Option<i64>, i64> = Ok(Some(I64(result as i64)));
+        let result = self.invoke_in_so(method, offset as i32, size as i32);
+        //let result: Result<Option<i64>, i64> = Ok(Some(I64(result as i64)));
 
-        /*
+        eprintln!("result: {:?}", result);
+
         let r = result as u32;
         let offset = r as u32;
         let length = (r >> 32) as u32 as usize;
         let result = memory.get(offset, length).map_err(|_| ErrorKind::Runtime.into());
-        */
 
+        /*
 		let result = module_instance.invoke_export(
 			method,
 			&[
@@ -734,7 +766,9 @@ impl WasmExecutor {
 			],
 			&mut fec
 		);
+        */
 
+        /*
 		let result = match result {
 			Ok(Some(I64(r))) => {
 				let offset = r as u32;
@@ -748,6 +782,7 @@ impl WasmExecutor {
 				Err(e.into())
 			},
 		};
+        */
 
 		// cleanup module instance for next use
 		let new_low = memory.lowest_used();
