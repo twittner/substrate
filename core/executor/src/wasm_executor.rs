@@ -57,6 +57,9 @@ lazy_static! {
                 &'static mut FunctionExecutor
         >
     > = Default::default();
+
+    //static ref thisEXT: &'static mut Externalities<Blake2Hasher> =
+        //Externalities::<Blake2Hasher>::default();
 }
 
 unsafe impl Send for FunctionExecutor{}
@@ -677,12 +680,19 @@ ext_storage_changes_root(parent_hash_data: *const u8, parent_hash_len: u32, pare
         //return Err(UserError("Invalid parent_hash_len in ext_storage_changes_root").into());
         return 0;
     }
+    /*
+    let unwrap_mutex = thisFE.lock().unwrap();
+    let the_option = unwrap_mutex.deref();
+    let mut fec = &mut the_option.unwrap();
+    */
 
     //let unwrap_mutex: Option<&'static mut FunctionExecutor> = thisFE.get_mut().unwrap();
     //let unwrap_mutex: Option<&'static mut FunctionExecutor> = thisFE.lock().unwrap().deref();
     let unwrap_mutex = thisFE.lock().unwrap();
-    let foo = unwrap_mutex.deref();
-    let fec = foo.unwrap();
+    let the_option = unwrap_mutex.deref();
+    let mut fec = &mut the_option.unwrap();
+
+    //let () = fec;
 
     //let fec = thisFE.lock().unwrap().clone().unwrap();
 
@@ -697,9 +707,16 @@ ext_storage_changes_root(parent_hash_data: *const u8, parent_hash_len: u32, pare
     //let bar = foo.as_ref().unwrap();
     //let () = bar;
     //let fec: &mut FunctionExecutor = &mut *bar;
+    */
+
+    //let memory = &fec.memory;
+    //let ext = &mut fec.ext;
+    //
 
     let memory = &fec.memory;
-    let ext = &fec.ext;
+	//let ext = &mut fec.ext;
+    
+	let ext = &mut fec.ext;
 
     //let ext = &thisFE.lock().unwrap().as_ref().unwrap().ext;
     let raw_parent_hash = (*memory).get(parent_hash_data, parent_hash_len as usize).unwrap();
@@ -707,13 +724,12 @@ ext_storage_changes_root(parent_hash_data: *const u8, parent_hash_len: u32, pare
     parent_hash.as_mut().copy_from_slice(&raw_parent_hash[..]);
     let r = ext.storage_changes_root(parent_hash, parent_number);
     if let Some(ref r) = r {
-        thisFE.lock().unwrap().unwrap().memory.set(result, &r[..]);
+        memory.set(result, &r[..]);
         //.map_err(|_| UserError("Invalid attempt to set memory in ext_storage_changes_root"))?;
     }
     if r.is_some() { 1u32 } else { 0u32 }
     //Ok(if r.is_some() { 1u32 } else { 0u32 })
-    */
-    1u32
+    //1u32
 }
 
 /// Wasm rust executor for contracts.
