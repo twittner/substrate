@@ -688,8 +688,9 @@ ext_storage_changes_root(parent_hash_data: *const u8, parent_hash_len: u32, pare
 
     //let unwrap_mutex: Option<&'static mut FunctionExecutor> = thisFE.get_mut().unwrap();
     //let unwrap_mutex: Option<&'static mut FunctionExecutor> = thisFE.lock().unwrap().deref();
-    let unwrap_mutex = thisFE.lock().unwrap();
-    let the_option = unwrap_mutex.deref();
+    //
+    let mut unwrap_mutex = thisFE.lock().unwrap();
+    let the_option = unwrap_mutex.as_mut();
     let mut fec = &mut the_option.unwrap();
 
     //let () = fec;
