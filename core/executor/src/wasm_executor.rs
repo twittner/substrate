@@ -65,14 +65,20 @@ lazy_static! {
 unsafe impl Send for FunctionExecutor{}
 unsafe impl Sync for FunctionExecutor{}
 
-#[link(name = "node_runtime")]
-#[link(name = "substrate_test_runtime")]
+//#[link(name = "node_runtime")]
+//#[link(name = "substrate_test_runtime")]
 #[link(name = "runtime_test")]
 
 extern {
 	//fn Z_test_blake2_256Z_jii(input: libc::c_int) -> libc::c_int;
-	fn Z_test_blake2_256Z_jii(offset: libc::uint32_t, size: libc::uint32_t) -> libc::uint64_t;
-	//fn Z_test_blake2_256Z_jii(offset: u32, size: u32) -> u64;
+	//fn Z_test_blake2_256Z_jii(
+	fn init();
+
+	fn Z_test_blake2_256Z_jii(offset: u32, size: u32) -> u64;
+
+	fn Z_test_empty_returnZ_jii(offset: u32, size: u32) -> u64;
+
+	//fn Z_test_empty_returnZ_jii(offset: libc::uint32_t, size: libc::uint32_t) -> libc::uint64_t;
     //  24   │ typedef uint32_t u32; 26   │ typedef uint64_t u64;
 }
 
@@ -767,6 +773,7 @@ ext_storage_changes_root(parent_hash_data: *const u8, parent_hash_len: u32, pare
 }
 
 #[no_mangle] extern fn Z_envZ_ext_mallocZ_ii(size: u32) -> u32 {
+    eprintln!("ext_malloc {:?}", size);
     /*
     let r = thisFE.lock().unwrap().heap.allocate(size);
     debug_trace!(target: "sr-io", "malloc {} bytes at {}", size, r);
@@ -776,6 +783,7 @@ ext_storage_changes_root(parent_hash_data: *const u8, parent_hash_len: u32, pare
 }
 
 #[no_mangle] extern fn Z_envZ_ext_freeZ_vi(addr: u32) {
+    eprintln!("ext_free {:?}", addr);
     /*
     thisFE.lock().unwrap().heap.deallocate(addr);
     debug_trace!(target: "sr-io", "free {}", addr);
@@ -1393,17 +1401,21 @@ impl WasmExecutor {
 
         let arc_ref = &mut fec;
         *thisFE.lock().unwrap() = Some(unsafe { mem::transmute(arc_ref) });
+        eprintln!("transmute had happened");
 
         /*
         let result = self.invoke_in_so(method, offset as i32, size as i32);
         */
         //let result: Result<Option<i64>, i64> = Ok(Some(I64(result as i64)));
 
+        eprintln!("before method");
 		let result = match method {
 			//"test_blake2_256" => unsafe { Z_test_blake2_256Z_jii(offset as i32, size as i32) },
 			"test_blake2_256" => unsafe { Z_test_blake2_256Z_jii(offset as u32, size as u32) },
+			"test_empty_return" => unsafe { Z_test_empty_returnZ_jii(offset as u32, size as u32) },
 			&_ => 0,
 		};
+        eprintln!("after method");
 
         eprintln!("result: {:?}", result);
 
@@ -1490,9 +1502,11 @@ mod tests {
 
 	#[test]
 	fn returning_should_work() {
+        unsafe { init(); }
 		let mut ext = TestExternalities::default();
 		let test_code = include_bytes!("../wasm/target/wasm32-unknown-unknown/release/runtime_test.compact.wasm");
 
+        eprintln!("about to call");
 		let output = WasmExecutor::new().call(&mut ext, 8, &test_code[..], "test_empty_return", &[]).unwrap();
 		assert_eq!(output, vec![0u8; 0]);
 	}

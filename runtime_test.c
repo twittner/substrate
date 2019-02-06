@@ -1,5 +1,6 @@
 #include <math.h>
 #include <string.h>
+#include <stdio.h>
 
 #include "runtime_test.h"
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
@@ -5472,11 +5473,17 @@ static u64 test_clear_prefix(u32 p0, u32 p1) {
 }
 
 static u64 test_empty_return(u32 p0, u32 p1) {
+  fprintf(stderr, "test_empty_return, before epilogue");
+  //fprintf(stderr, "test_empty_return(%d, %d)\n", p0, p1);
+  /*
   FUNC_PROLOGUE;
   u64 j0;
   j0 = 1ull;
   FUNC_EPILOGUE;
+  fprintf(stderr, "test_empty_return, after epilogue");
   return j0;
+  */
+  return 0;
 }
 
 static u64 test_panic(u32 p0, u32 p1) {
@@ -8960,6 +8967,7 @@ u64 (*WASM_RT_ADD_PREFIX(Z_test_sandbox_return_valZ_jii))(u32, u32);
 u64 (*WASM_RT_ADD_PREFIX(Z_test_sandbox_instantiateZ_jii))(u32, u32);
 
 static void init_exports(void) {
+  fprintf(stderr, "init_exports");
   /* export: 'memory' */
   WASM_RT_ADD_PREFIX(Z_memory) = (&memory);
   /* export: '__indirect_function_table' */
@@ -8999,9 +9007,18 @@ static void init_exports(void) {
 }
 
 void WASM_RT_ADD_PREFIX(init)(void) {
+  fprintf(stderr, "init_func_types\n");
   init_func_types();
+
+  fprintf(stderr, "init_globals\n");
   init_globals();
+
+  fprintf(stderr, "init_memory\n");
   init_memory();
+
+  fprintf(stderr, "init_table\n");
   init_table();
+
+  fprintf(stderr, "init_exports\n");
   init_exports();
 }
