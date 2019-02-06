@@ -21,6 +21,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
 
 #define PAGE_SIZE 65536
 
@@ -39,12 +41,14 @@ FuncType* g_func_types;
 uint32_t g_func_type_count;
 
 void wasm_rt_trap(wasm_rt_trap_t code) {
+	 fprintf(stderr, "wasm_rt_trap\n");
   assert(code != WASM_RT_TRAP_NONE);
   wasm_rt_call_stack_depth = g_saved_call_stack_depth;
   longjmp(g_jmp_buf, code);
 }
 
 static bool func_types_are_equal(FuncType* a, FuncType* b) {
+	 fprintf(stderr, "func_types_are_equal\n");
   if (a->param_count != b->param_count || a->result_count != b->result_count)
     return 0;
   int i;
@@ -60,6 +64,7 @@ static bool func_types_are_equal(FuncType* a, FuncType* b) {
 uint32_t wasm_rt_register_func_type(uint32_t param_count,
                                     uint32_t result_count,
                                     ...) {
+	 fprintf(stderr, "wasm_rt_register_func_type\n");
   FuncType func_type;
   func_type.param_count = param_count;
   func_type.params = malloc(param_count * sizeof(wasm_rt_type_t));
@@ -93,6 +98,7 @@ uint32_t wasm_rt_register_func_type(uint32_t param_count,
 void wasm_rt_allocate_memory(wasm_rt_memory_t* memory,
                              uint32_t initial_pages,
                              uint32_t max_pages) {
+	 fprintf(stderr, "wasm_rt_allocate_memory\n");
   memory->pages = initial_pages;
   memory->max_pages = max_pages;
   memory->size = initial_pages * PAGE_SIZE;
@@ -100,6 +106,7 @@ void wasm_rt_allocate_memory(wasm_rt_memory_t* memory,
 }
 
 uint32_t wasm_rt_grow_memory(wasm_rt_memory_t* memory, uint32_t delta) {
+	 fprintf(stderr, "wasm_rt_grow_memory\n");
   uint32_t old_pages = memory->pages;
   uint32_t new_pages = memory->pages + delta;
   if (new_pages < old_pages || new_pages > memory->max_pages) {
@@ -115,6 +122,7 @@ uint32_t wasm_rt_grow_memory(wasm_rt_memory_t* memory, uint32_t delta) {
 void wasm_rt_allocate_table(wasm_rt_table_t* table,
                             uint32_t elements,
                             uint32_t max_elements) {
+	 fprintf(stderr, "wasm_rt_allocate_table\n");
   table->size = elements;
   table->max_size = max_elements;
   table->data = calloc(table->size, sizeof(wasm_rt_elem_t));

@@ -5483,7 +5483,7 @@ static u64 test_empty_return(u32 p0, u32 p1) {
   fprintf(stderr, "test_empty_return, after epilogue");
   return j0;
   */
-  return 0;
+  return 1;
 }
 
 static u64 test_panic(u32 p0, u32 p1) {

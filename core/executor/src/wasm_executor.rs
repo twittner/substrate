@@ -69,7 +69,7 @@ unsafe impl Sync for FunctionExecutor{}
 //#[link(name = "substrate_test_runtime")]
 #[link(name = "runtime_test")]
 
-extern {
+extern "C" {
 	//fn Z_test_blake2_256Z_jii(input: libc::c_int) -> libc::c_int;
 	//fn Z_test_blake2_256Z_jii(
 	fn init();
@@ -77,8 +77,10 @@ extern {
 	fn Z_test_blake2_256Z_jii(offset: u32, size: u32) -> u64;
 
 	fn Z_test_empty_returnZ_jii(offset: u32, size: u32) -> u64;
+	//fn test_empty_return(offset: u32, size: u32) -> u64;
 
 	//fn Z_test_empty_returnZ_jii(offset: libc::uint32_t, size: libc::uint32_t) -> libc::uint64_t;
+
     //  24   │ typedef uint32_t u32; 26   │ typedef uint64_t u64;
 }
 
@@ -1409,10 +1411,15 @@ impl WasmExecutor {
         //let result: Result<Option<i64>, i64> = Ok(Some(I64(result as i64)));
 
         eprintln!("before method");
+        eprintln!("offset: {:?}", offset);
+        eprintln!("offset as u32: {:?}", offset as u32);
+        eprintln!("size: {:?}", size);
+        eprintln!("size as u32: {:?}", size as u32);
 		let result = match method {
 			//"test_blake2_256" => unsafe { Z_test_blake2_256Z_jii(offset as i32, size as i32) },
 			"test_blake2_256" => unsafe { Z_test_blake2_256Z_jii(offset as u32, size as u32) },
 			"test_empty_return" => unsafe { Z_test_empty_returnZ_jii(offset as u32, size as u32) },
+			//"test_empty_return" => unsafe { test_empty_return(offset as u32, size as u32) },
 			&_ => 0,
 		};
         eprintln!("after method");
@@ -1506,7 +1513,7 @@ mod tests {
 		let mut ext = TestExternalities::default();
 		let test_code = include_bytes!("../wasm/target/wasm32-unknown-unknown/release/runtime_test.compact.wasm");
 
-        eprintln!("about to call");
+        eprintln!("\nabout to call");
 		let output = WasmExecutor::new().call(&mut ext, 8, &test_code[..], "test_empty_return", &[]).unwrap();
 		assert_eq!(output, vec![0u8; 0]);
 	}
