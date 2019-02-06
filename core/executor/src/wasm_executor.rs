@@ -1417,7 +1417,7 @@ impl WasmExecutor {
         eprintln!("offset as u32: {:?}", offset as u32);
         eprintln!("size: {:?}", size);
         eprintln!("size as u32: {:?}", size as u32);
-		let result = match method {
+		let result: u64 = match method {
 			//"test_blake2_256" => unsafe { Z_test_blake2_256Z_jii(offset as i32, size as i32) },
 			"test_blake2_256" => unsafe { Z_test_blake2_256Z_jii(offset as u32, size as u32) },
 			//"test_empty_return" => unsafe { Z_test_empty_returnZ_jii(offset as u32, size as u32) },
@@ -1434,7 +1434,9 @@ impl WasmExecutor {
         let r = result as u32;
         let offset = r as u32;
         let length = (r >> 32) as u32 as usize;
+        eprintln!("length: {:?}", length);
         let result = memory.get(offset, length).map_err(|_| ErrorKind::Runtime.into());
+        eprintln!("result from memory.get: {:?}", result);
 
         /*
 		let result = module_instance.invoke_export(

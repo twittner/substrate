@@ -5485,8 +5485,9 @@ u64 test_empty_return(u32 p0, u32 p1) {
   u64 j0;
   j0 = 1ull;
   FUNC_EPILOGUE;
-  fprintf(stderr, "test_empty_return, after epilogue");
-  return j0;
+  fprintf(stderr, "test_empty_return, after epilogue\n");
+  fprintf(stderr, "test_empty_return, return with %d\n", j0);
+  return &j0;
   //return 1;
 }
 
