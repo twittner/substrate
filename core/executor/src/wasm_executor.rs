@@ -80,6 +80,7 @@ extern "C" {
 
 	fn Z_test_empty_returnZ_jii(offset: u32, size: u32) -> u64;
 	fn test_empty_return(offset: u32, size: u32) -> u64;
+	fn test_data_in(offset: u32, size: u32) -> u64;
 
 	//fn Z_test_empty_returnZ_jii(offset: libc::uint32_t, size: libc::uint32_t) -> libc::uint64_t;
 
@@ -749,7 +750,17 @@ ext_storage_changes_root(parent_hash_data: *const u8, parent_hash_len: u32, pare
 // the mangling which wasm2c introduces though. That's why the functions below
 // follow the mangling scheme which wasm2c introduces.
 //#[link(name = "node_runtime")]
-#[no_mangle] extern fn Z_envZ_ext_print_utf8Z_vii(utf8_data: *const u8, utf8_len: u32) {
+#[no_mangle] pub extern "C" fn Z_envZ_ext_print_utf8Z_vii(utf8_data: u32, utf8_len: u32) {
+    let mut unwrap_mutex = thisFE.lock().unwrap();
+    let the_option = unwrap_mutex.as_mut();
+    let mut fec = &mut the_option.unwrap();
+    let memory = &fec.memory;
+
+    if let Ok(utf8) = (*memory).get(utf8_data, utf8_len as usize) {
+        if let Ok(message) = String::from_utf8(utf8) {
+            println!("{}", message);
+        }
+    }
     /*
     if let Ok(utf8) = thisFE.lock().unwrap().memory.get(utf8_data, utf8_len as usize) {
         if let Ok(message) = String::from_utf8(utf8) {
@@ -758,6 +769,7 @@ ext_storage_changes_root(parent_hash_data: *const u8, parent_hash_len: u32, pare
     }
     Ok(())
     */
+    //Ok(())
 }
 
 #[no_mangle] extern fn Z_envZ_ext_print_hexZ_vii(data: u32, len: u32) {
@@ -776,37 +788,66 @@ ext_storage_changes_root(parent_hash_data: *const u8, parent_hash_len: u32, pare
     */
 }
 
-#[no_mangle] extern fn Z_envZ_ext_mallocZ_ii(size: u32) -> u32 {
+#[no_mangle] pub extern "C" fn Z_envZ_ext_mallocZ_ii(size: u32) -> u32 {
     eprintln!("ext_malloc {:?}", size);
+    let mut unwrap_mutex = thisFE.lock().unwrap();
+    let the_option = unwrap_mutex.as_mut();
+    let mut fec = &mut the_option.unwrap();
+    let memory = &fec.memory;
+    let heap = &mut fec.heap;
+	let ext = &mut fec.ext;
+    let hash_lookup = &fec.hash_lookup;
+
+    let r = heap.allocate(size);
+    debug_trace!(target: "sr-io", "malloc {} bytes at {}", size, r);
+    eprintln!("malloc {} bytes at {}", size, r);
+    //Ok(r)
+    r
+
     /*
     let r = thisFE.lock().unwrap().heap.allocate(size);
     debug_trace!(target: "sr-io", "malloc {} bytes at {}", size, r);
     Ok(r)
     */
-    0u32
+    //0u32
 }
 
-#[no_mangle] extern fn Z_envZ_ext_freeZ_vi(addr: u32) {
+#[no_mangle] pub extern "C" fn Z_envZ_ext_freeZ_vi(addr: u32) {
     eprintln!("ext_free {:?}", addr);
-    /*
-    thisFE.lock().unwrap().heap.deallocate(addr);
+    let mut unwrap_mutex = thisFE.lock().unwrap();
+    let the_option = unwrap_mutex.as_mut();
+    let mut fec = &mut the_option.unwrap();
+    let memory = &fec.memory;
+    let heap = &mut fec.heap;
+	let ext = &mut fec.ext;
+    let hash_lookup = &fec.hash_lookup;
+    
+    heap.deallocate(addr);
+    eprintln!("free {}", addr);
     debug_trace!(target: "sr-io", "free {}", addr);
-    Ok(())
-    */
 }
 
-#[no_mangle] extern fn Z_envZ_ext_set_storageZ_viiii(key_data: u32, key_len: u32, value_data: u32, value_len: u32) {
-    /*
-    let key = thisFE.lock().unwrap().memory.get(key_data, key_len as usize).map_err(|_| UserError("Invalid attempt to determine key in ext_set_storage"))?;
-    let value = thisFE.lock().unwrap().memory.get(value_data, value_len as usize).map_err(|_| UserError("Invalid attempt to determine value in ext_set_storage"))?;
-    if let Some(_preimage) = thisFE.lock().unwrap().hash_lookup.get(&key) {
+#[no_mangle] pub extern "C" fn Z_envZ_ext_set_storageZ_viiii(key_data: u32, key_len: u32, value_data: u32, value_len: u32) {
+    eprintln!("ext_set_storage");
+    let mut unwrap_mutex = thisFE.lock().unwrap();
+    let the_option = unwrap_mutex.as_mut();
+    let mut fec = &mut the_option.unwrap();
+    let memory = &fec.memory;
+	let ext = &mut fec.ext;
+    let hash_lookup = &fec.hash_lookup;
+
+    let key = (*memory).get(key_data, key_len as usize).unwrap();
+        //.map_err(|_| UserError("Invalid attempt to determine key in ext_set_storage"))?;
+    let value = (*memory).get(value_data, value_len as usize).unwrap();
+        //.map_err(|_| UserError("Invalid attempt to determine value in ext_set_storage"))?;
+    if let Some(_preimage) = hash_lookup.get(&key) {
         debug_trace!(target: "wasm-trace", "*** Setting storage: %{} -> {}   [k={}]", ::primitives::hexdisplay::ascii_format(&_preimage), HexDisplay::from(&value), HexDisplay::from(&key));
+        eprintln!("*** Setting storage: %{} -> {}   [k={}]", ::primitives::hexdisplay::ascii_format(&_preimage), HexDisplay::from(&value), HexDisplay::from(&key));
     } else {
         debug_trace!(target: "wasm-trace", "*** Setting storage:  {} -> {}   [k={}]", ::primitives::hexdisplay::ascii_format(&key), HexDisplay::from(&value), HexDisplay::from(&key));
+        eprintln!("*** Setting storage:  {} -> {}   [k={}]", ::primitives::hexdisplay::ascii_format(&key), HexDisplay::from(&value), HexDisplay::from(&key));
     }
-    thisFE.lock().unwrap().ext.set_storage(key, value);
-    Ok(())
-    */
+    ext.set_storage(key, value);
 }
 
     /*
@@ -908,16 +949,24 @@ ext_storage_changes_root(parent_hash_data: *const u8, parent_hash_len: u32, pare
     */
 
 // return 0 and place u32::max_value() into written_out if no value exists for the key.
-#[no_mangle] extern fn Z_envZ_ext_get_allocated_storageZ_iiii(key_data: u32, key_len: u32, written_out: u32) -> u32 {
-    /*
-    let key = thisFE.lock().unwrap().memory.get(
+#[no_mangle] pub extern "C" fn Z_envZ_ext_get_allocated_storageZ_iiii(key_data: u32, key_len: u32, written_out: u32) -> u32 {
+    let mut unwrap_mutex = thisFE.lock().unwrap();
+    let the_option = unwrap_mutex.as_mut();
+    let mut fec = &mut the_option.unwrap();
+    let memory = &fec.memory;
+	let ext = &mut fec.ext;
+    let hash_lookup = &fec.hash_lookup;
+    let heap = &mut fec.heap;
+
+    let key = (*memory).get(
         key_data,
         key_len as usize
-    ).map_err(|_| UserError("Invalid attempt to determine key in ext_get_allocated_storage"))?;
-    let maybe_value = thisFE.lock().unwrap().ext.storage(&key);
+    ).unwrap();
+    //).map_err(|_| UserError("Invalid attempt to determine key in ext_get_allocated_storage"))?;
+    let maybe_value = ext.storage(&key);
 
     debug_trace!(target: "wasm-trace", "*** Getting storage: {} == {}   [k={}]",
-        if let Some(_preimage) = thisFE.lock().unwrap().hash_lookup.get(&key) {
+        if let Some(_preimage) = hash_lookup.get(&key) {
             format!("%{}", ::primitives::hexdisplay::ascii_format(&_preimage))
         } else {
             format!(" {}", ::primitives::hexdisplay::ascii_format(&key))
@@ -931,18 +980,20 @@ ext_storage_changes_root(parent_hash_data: *const u8, parent_hash_len: u32, pare
     );
 
     if let Some(value) = maybe_value {
-        let offset = thisFE.lock().unwrap().heap.allocate(value.len() as u32) as u32;
-        thisFE.lock().unwrap().memory.set(offset, &value).map_err(|_| UserError("Invalid attempt to set memory in ext_get_allocated_storage"))?;
-        thisFE.lock().unwrap().memory.write_primitive(written_out, value.len() as u32)
-            .map_err(|_| UserError("Invalid attempt to write written_out in ext_get_allocated_storage"))?;
-        Ok(offset)
+        let offset = heap.allocate(value.len() as u32) as u32;
+        (*memory).set(offset, &value).unwrap();
+            //.map_err(|_| UserError("Invalid attempt to set memory in ext_get_allocated_storage"))?;
+        (*memory).write_primitive(written_out, value.len() as u32).unwrap();
+            //.map_err(|_| UserError("Invalid attempt to write written_out in ext_get_allocated_storage"))?;
+        //Ok(offset)
+        offset
     } else {
-        thisFE.lock().unwrap().memory.write_primitive(written_out, u32::max_value())
-            .map_err(|_| UserError("Invalid attempt to write failed written_out in ext_get_allocated_storage"))?;
-        Ok(0)
+        (*memory).write_primitive(written_out, u32::max_value())
+            .unwrap();
+            //.map_err(|_| UserError("Invalid attempt to write failed written_out in ext_get_allocated_storage"))?;
+        //Ok(0)
+        0
     }
-    */
-    0u32
 }
 
     /*
@@ -1425,15 +1476,18 @@ impl WasmExecutor {
 			//"test_empty_return" => unsafe { bar(offset as u32, size as u32) },
 
 			"test_empty_return" => unsafe { test_empty_return(offset as u32, size as u32) },
+			"test_data_in" => unsafe { test_data_in(offset as u32, size as u32) },
 			&_ => 0,
 		};
         eprintln!("after method");
 
         eprintln!("result: {:?}", result);
 
-        let r = result as u32;
+        let r = result;
         let offset = r as u32;
+        //let length = (r >> 32) as u32 as usize;
         let length = (r >> 32) as u32 as usize;
+        eprintln!("offset: {:?}", offset);
         eprintln!("length: {:?}", length);
         let result = memory.get(offset, length).map_err(|_| ErrorKind::Runtime.into());
         eprintln!("result from memory.get: {:?}", result);
@@ -1542,6 +1596,7 @@ mod tests {
 
 	#[test]
 	fn storage_should_work() {
+        unsafe { init(); }
 		let mut ext = TestExternalities::default();
 		ext.set_storage(b"foo".to_vec(), b"bar".to_vec());
 		let test_code = include_bytes!("../wasm/target/wasm32-unknown-unknown/release/runtime_test.compact.wasm");

@@ -202,7 +202,8 @@ static u32 __rust_alloc_zeroed(u32);
 static void _ZN12parity_codec5codec6Encode6encode17h7199eee6cd6e7a2fE(u32, u32);
 static void _ZN20substrate_primitives7sandbox27_IMPL_ENCODE_FOR_TypedValue99__LT_impl_u20_parity_codec__codec__Encode_u20_for_u20_substrate_primitives__sandbox__TypedValue_GT_9encode_to17h055d1be133032210E(u32, u32);
 static void _ZN12parity_codec5codec6Encode6encode17ha70755ab770d169bE(u32, u32);
-static u64 test_data_in(u32, u32);
+//static u64 test_data_in(u32, u32);
+u64 test_data_in(u32, u32);
 static u64 test_clear_prefix(u32, u32);
 //static u64 test_empty_return(u32, u32);
 u64 test_empty_return(u32, u32);
@@ -815,11 +816,13 @@ static u32 __rust_realloc(u32 p0, u32 p1, u32 p2) {
 }
 
 static u32 __rust_alloc(u32 p0) {
+  fprintf(stderr, "__rust_alloc, start, p0 %d\n", p0);
   FUNC_PROLOGUE;
   u32 i0;
   i0 = p0;
   i0 = __rg_alloc(i0);
   FUNC_EPILOGUE;
+  fprintf(stderr, "__rust_alloc, end, i0 %d\n", i0);
   return i0;
 }
 
@@ -1811,7 +1814,9 @@ static u32 __rg_alloc(u32 p0) {
   FUNC_PROLOGUE;
   u32 i0;
   i0 = p0;
-  i0 = (*Z_envZ_ext_mallocZ_ii)(i0);
+  //i0 = (*Z_envZ_ext_mallocZ_ii)(i0);
+  fprintf(stderr, "before calling Z_envZ_ext_mallocZ_ii with p0 %d\n", p0);
+  i0 = Z_envZ_ext_mallocZ_ii(i0);
   FUNC_EPILOGUE;
   return i0;
 }
@@ -1820,7 +1825,8 @@ static void __rg_dealloc(u32 p0) {
   FUNC_PROLOGUE;
   u32 i0;
   i0 = p0;
-  (*Z_envZ_ext_freeZ_vi)(i0);
+  //(*Z_envZ_ext_freeZ_vi)(i0);
+  Z_envZ_ext_freeZ_vi(i0);
   FUNC_EPILOGUE;
 }
 
@@ -5326,7 +5332,9 @@ static void _ZN12parity_codec5codec6Encode6encode17ha70755ab770d169bE(u32 p0, u3
   FUNC_EPILOGUE;
 }
 
-static u64 test_data_in(u32 p0, u32 p1) {
+u64 test_data_in(u32 p0, u32 p1) {
+  fprintf(stderr, "test_data_in, p0 %d\n", p0);
+  fprintf(stderr, "test_data_in, p1 %d\n", p1);
   u32 l2 = 0, l3 = 0;
   FUNC_PROLOGUE;
   u32 i0, i1, i2, i3, i4;
@@ -5338,7 +5346,12 @@ static u64 test_data_in(u32 p0, u32 p1) {
   g0 = i0;
   i0 = 1048949u;
   i1 = 11u;
-  (*Z_envZ_ext_print_utf8Z_vii)(i0, i1);
+  fprintf(stderr, "before print\n");
+
+  Z_envZ_ext_print_utf8Z_vii(i0, i1);
+
+  //(*Z_envZ_ext_print_utf8Z_vii)(i0, i1);
+  fprintf(stderr, "after print\n");
   i0 = 1048960u;
   i1 = 5u;
   i2 = p0;
@@ -5346,21 +5359,26 @@ static u64 test_data_in(u32 p0, u32 p1) {
   i4 = p1;
   i2 = i4 ? i2 : i3;
   i3 = p1;
-  (*Z_envZ_ext_set_storageZ_viiii)(i0, i1, i2, i3);
+  fprintf(stderr, "1\n");
+  Z_envZ_ext_set_storageZ_viiii(i0, i1, i2, i3);
   i0 = 1048965u;
   i1 = 7u;
-  (*Z_envZ_ext_print_utf8Z_vii)(i0, i1);
+  Z_envZ_ext_print_utf8Z_vii(i0, i1);
   i0 = l2;
   i1 = 0u;
+  fprintf(stderr, "2\n");
   i32_store((&memory), (u64)(i0 + 12), i1);
+  fprintf(stderr, "2.5\n");
   i0 = 1048972u;
   i1 = 3u;
   i2 = l2;
   i3 = 12u;
   i2 += i3;
-  i0 = (*Z_envZ_ext_get_allocated_storageZ_iiii)(i0, i1, i2);
+  fprintf(stderr, "3\n");
+  i0 = Z_envZ_ext_get_allocated_storageZ_iiii(i0, i1, i2);
   l3 = i0;
   i0 = l2;
+  fprintf(stderr, "4\n");
   i0 = i32_load((&memory), (u64)(i0 + 12));
   p0 = i0;
   i1 = 4294967295u;
@@ -5368,17 +5386,22 @@ static u64 test_data_in(u32 p0, u32 p1) {
   if (i0) {goto B1;}
   i0 = 1048949u;
   i1 = 11u;
-  (*Z_envZ_ext_print_utf8Z_vii)(i0, i1);
+  Z_envZ_ext_print_utf8Z_vii(i0, i1);
   i0 = 1048975u;
   i1 = 3u;
   i2 = l3;
   i3 = p0;
-  (*Z_envZ_ext_set_storageZ_viiii)(i0, i1, i2, i3);
+  fprintf(stderr, "5\n");
+  Z_envZ_ext_set_storageZ_viiii(i0, i1, i2, i3);
+  fprintf(stderr, "5.5\n");
   i0 = 1048978u;
   i1 = 9u;
-  (*Z_envZ_ext_print_utf8Z_vii)(i0, i1);
+  Z_envZ_ext_print_utf8Z_vii(i0, i1);
   i0 = 7u;
+  fprintf(stderr, "5.8\n");
+  fprintf(stderr, "5.8 %d\n", i0);
   i0 = __rust_alloc(i0);
+  fprintf(stderr, "5.9\n");
   p1 = i0;
   i0 = !(i0);
   if (i0) {goto B0;}
@@ -5386,6 +5409,7 @@ static u64 test_data_in(u32 p0, u32 p1) {
   i1 = 6u;
   i0 += i1;
   i1 = 0u;
+  fprintf(stderr, "6\n");
   i1 = i32_load8_u((&memory), (u64)(i1 + 1048993));
   i32_store8((&memory), (u64)(i0), i1);
   i0 = p1;
@@ -5402,6 +5426,7 @@ static u64 test_data_in(u32 p0, u32 p1) {
   i0 = !(i0);
   if (i0) {goto B2;}
   i0 = l3;
+  fprintf(stderr, "7\n");
   __rust_dealloc(i0);
   B2:;
   i0 = l2;
@@ -5424,6 +5449,7 @@ static u64 test_data_in(u32 p0, u32 p1) {
   UNREACHABLE;
   Bfunc:;
   FUNC_EPILOGUE;
+  fprintf(stderr, "end!");
   return j0;
 }
 

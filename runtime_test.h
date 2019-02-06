@@ -31,17 +31,18 @@ typedef double f64;
 extern void WASM_RT_ADD_PREFIX(init)(void);
 
 /* import: 'env' 'ext_print_utf8' */
-extern void (*Z_envZ_ext_print_utf8Z_vii)(u32, u32);
+//extern void (*Z_envZ_ext_print_utf8Z_vii)(u32, u32);
+extern void Z_envZ_ext_print_utf8Z_vii(u32, u32);
 /* import: 'env' 'ext_print_num' */
 extern void (*Z_envZ_ext_print_numZ_vj)(u64);
 /* import: 'env' 'ext_malloc' */
-extern u32 (*Z_envZ_ext_mallocZ_ii)(u32);
+extern u32 Z_envZ_ext_mallocZ_ii(u32);
 /* import: 'env' 'ext_free' */
-extern void (*Z_envZ_ext_freeZ_vi)(u32);
+extern void Z_envZ_ext_freeZ_vi(u32);
 /* import: 'env' 'ext_set_storage' */
-extern void (*Z_envZ_ext_set_storageZ_viiii)(u32, u32, u32, u32);
+extern void Z_envZ_ext_set_storageZ_viiii(u32, u32, u32, u32);
 /* import: 'env' 'ext_get_allocated_storage' */
-extern u32 (*Z_envZ_ext_get_allocated_storageZ_iiii)(u32, u32, u32);
+extern u32 Z_envZ_ext_get_allocated_storageZ_iiii(u32, u32, u32);
 /* import: 'env' 'ext_clear_prefix' */
 extern void (*Z_envZ_ext_clear_prefixZ_vii)(u32, u32);
 /* import: 'env' 'ext_blake2_256' */
