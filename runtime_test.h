@@ -79,7 +79,7 @@ extern u64 (*WASM_RT_ADD_PREFIX(Z_test_data_inZ_jii))(u32, u32);
 extern u64 (*WASM_RT_ADD_PREFIX(Z_test_clear_prefixZ_jii))(u32, u32);
 /* export: 'test_empty_return' */
 extern u64 (*WASM_RT_ADD_PREFIX(Z_test_empty_returnZ_jii))(u32, u32);
-//extern u64 test_empty_return(u32, u32);
+extern u64 test_empty_return(u32, u32);
 /* export: 'test_panic' */
 extern u64 (*WASM_RT_ADD_PREFIX(Z_test_panicZ_jii))(u32, u32);
 /* export: 'test_conditional_panic' */

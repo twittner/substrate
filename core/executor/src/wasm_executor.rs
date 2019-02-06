@@ -67,17 +67,19 @@ unsafe impl Sync for FunctionExecutor{}
 
 //#[link(name = "node_runtime")]
 //#[link(name = "substrate_test_runtime")]
-#[link(name = "runtime_test")]
+#[link(name = "runtime_test", kind = "dylib")]
 
 extern "C" {
 	//fn Z_test_blake2_256Z_jii(input: libc::c_int) -> libc::c_int;
 	//fn Z_test_blake2_256Z_jii(
 	fn init();
 
+	fn bar(offset: u32, size: u32) -> u64;
+
 	fn Z_test_blake2_256Z_jii(offset: u32, size: u32) -> u64;
 
 	fn Z_test_empty_returnZ_jii(offset: u32, size: u32) -> u64;
-	//fn test_empty_return(offset: u32, size: u32) -> u64;
+	fn test_empty_return(offset: u32, size: u32) -> u64;
 
 	//fn Z_test_empty_returnZ_jii(offset: libc::uint32_t, size: libc::uint32_t) -> libc::uint64_t;
 
@@ -746,7 +748,7 @@ ext_storage_changes_root(parent_hash_data: *const u8, parent_hash_len: u32, pare
 // DISCLAIMER: Yeah, I know about the mangling. Haven't found an option to disable
 // the mangling which wasm2c introduces though. That's why the functions below
 // follow the mangling scheme which wasm2c introduces.
-#[link(name = "node_runtime")]
+//#[link(name = "node_runtime")]
 #[no_mangle] extern fn Z_envZ_ext_print_utf8Z_vii(utf8_data: *const u8, utf8_len: u32) {
     /*
     if let Ok(utf8) = thisFE.lock().unwrap().memory.get(utf8_data, utf8_len as usize) {
@@ -1418,8 +1420,11 @@ impl WasmExecutor {
 		let result = match method {
 			//"test_blake2_256" => unsafe { Z_test_blake2_256Z_jii(offset as i32, size as i32) },
 			"test_blake2_256" => unsafe { Z_test_blake2_256Z_jii(offset as u32, size as u32) },
-			"test_empty_return" => unsafe { Z_test_empty_returnZ_jii(offset as u32, size as u32) },
-			//"test_empty_return" => unsafe { test_empty_return(offset as u32, size as u32) },
+			//"test_empty_return" => unsafe { Z_test_empty_returnZ_jii(offset as u32, size as u32) },
+            
+			//"test_empty_return" => unsafe { bar(offset as u32, size as u32) },
+
+			"test_empty_return" => unsafe { test_empty_return(offset as u32, size as u32) },
 			&_ => 0,
 		};
         eprintln!("after method");

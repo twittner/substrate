@@ -204,7 +204,8 @@ static void _ZN20substrate_primitives7sandbox27_IMPL_ENCODE_FOR_TypedValue99__LT
 static void _ZN12parity_codec5codec6Encode6encode17ha70755ab770d169bE(u32, u32);
 static u64 test_data_in(u32, u32);
 static u64 test_clear_prefix(u32, u32);
-static u64 test_empty_return(u32, u32);
+//static u64 test_empty_return(u32, u32);
+u64 test_empty_return(u32, u32);
 static u64 test_panic(u32, u32);
 static void _ZN12runtime_test10test_panic28__u7b__u7b_closure_u7d__u7d_17hac0217cdb3c42e04E(void);
 static u64 test_conditional_panic(u32, u32);
@@ -5472,18 +5473,21 @@ static u64 test_clear_prefix(u32 p0, u32 p1) {
   return j0;
 }
 
-static u64 test_empty_return(u32 p0, u32 p1) {
-  fprintf(stderr, "test_empty_return, before epilogue");
+u64 bar(u32 p0, u32 p1) {
+  fprintf(stderr, "bar");
+    return 1;
+}
+
+u64 test_empty_return(u32 p0, u32 p1) {
+  //fprintf(stderr, "test_empty_return, before epilogue");
   //fprintf(stderr, "test_empty_return(%d, %d)\n", p0, p1);
-  /*
   FUNC_PROLOGUE;
   u64 j0;
   j0 = 1ull;
   FUNC_EPILOGUE;
   fprintf(stderr, "test_empty_return, after epilogue");
   return j0;
-  */
-  return 1;
+  //return 1;
 }
 
 static u64 test_panic(u32 p0, u32 p1) {
@@ -8987,7 +8991,10 @@ static void init_exports(void) {
   fprintf(stderr, "pointer p %p\n", &test_empty_return);
   fprintf(stderr, "pointer x %x\n", &test_empty_return);
 
-  WASM_RT_ADD_PREFIX(Z_test_empty_returnZ_jii) = (&test_empty_return);
+  fprintf(stderr, "pointer2 p %p\n", &Z_test_empty_returnZ_jii);
+  fprintf(stderr, "pointer2 x %x\n", &Z_test_empty_returnZ_jii);
+
+  //WASM_RT_ADD_PREFIX(Z_test_empty_returnZ_jii) = (&test_empty_return);
 
   /* export: 'test_panic' */
   WASM_RT_ADD_PREFIX(Z_test_panicZ_jii) = (&test_panic);
