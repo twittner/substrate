@@ -8980,8 +8980,15 @@ static void init_exports(void) {
   WASM_RT_ADD_PREFIX(Z_test_data_inZ_jii) = (&test_data_in);
   /* export: 'test_clear_prefix' */
   WASM_RT_ADD_PREFIX(Z_test_clear_prefixZ_jii) = (&test_clear_prefix);
+
   /* export: 'test_empty_return' */
+
   WASM_RT_ADD_PREFIX(Z_test_empty_returnZ_jii) = (&test_empty_return);
+  fprintf(stderr, "pointer p %p\n", &test_empty_return);
+  fprintf(stderr, "pointer x %x\n", &test_empty_return);
+
+  WASM_RT_ADD_PREFIX(Z_test_empty_returnZ_jii) = (&test_empty_return);
+
   /* export: 'test_panic' */
   WASM_RT_ADD_PREFIX(Z_test_panicZ_jii) = (&test_panic);
   /* export: 'test_conditional_panic' */
