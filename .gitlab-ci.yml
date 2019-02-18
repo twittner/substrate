@@ -135,7 +135,9 @@ build:rust:linux:release:          &build
         tee ./artifacts/VERSION;
       fi
     - sha256sum ./artifacts/substrate | tee ./artifacts/substrate.sha256
+    - echo "\n# building node-template\n"
     - ./scripts/node-template-release.sh ./artifacts/substrate-node-template.tar.gz
+    - cp -r scripts/docker/* ./artifacts
 
 
 
@@ -182,7 +184,7 @@ publish:docker:release:
     DOCKER_HOST:                   tcp://localhost:2375
     DOCKER_DRIVER:                 overlay2
     GIT_STRATEGY:                  none
-    DOCKERFILE:                    scripts/docker/Dockerfile
+    # DOCKERFILE:                  scripts/docker/Dockerfile
     CONTAINER_IMAGE:               parity/substrate
   script:
     - VERSION="$(cat ./artifacts/VERSION)"
@@ -190,7 +192,8 @@ publish:docker:release:
         || ( echo "no docker credentials provided"; exit 1 )
     - docker login -u "$Docker_Hub_User_Parity" -p "$Docker_Hub_Pass_Parity"
     - docker info
-    - docker build --tag $CONTAINER_IMAGE:$VERSION --tag $CONTAINER_IMAGE:latest -f $DOCKERFILE ./artifacts/
+    - cd ./artifacts
+    - docker build --tag $CONTAINER_IMAGE:$VERSION --tag $CONTAINER_IMAGE:latest .
     - echo docker push $CONTAINER_IMAGE:$VERSION
     - echo docker push $CONTAINER_IMAGE:latest
     - docker push $CONTAINER_IMAGE:development
