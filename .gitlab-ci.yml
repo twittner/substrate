@@ -296,12 +296,12 @@ publish:s3:doc:
 deploy:ew3:
   <<:                              *deploy
   environment:
-    name: gke-beta-ew3
+    name: parity-prod-ew3
 
 deploy:ue1:
   <<:                              *deploy
   environment:
-    name: gke-beta-ue1
+    name: parity-prod-ue1
 
 
 
