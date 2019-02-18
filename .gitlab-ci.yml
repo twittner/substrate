@@ -175,7 +175,12 @@ publish:docker:release:
   <<:                              *publish_build
   only:
     - kubernetes
+  image:                           docker:stable
+  services:
+    - docker:dind
   variables:
+    DOCKER_HOST:                   tcp://localhost:2375
+    DOCKER_DRIVER:                 overlay2
     GIT_STRATEGY:                  none
     DOCKERFILE:                    scripts/docker/Dockerfile
     CONTAINER_IMAGE:               parity/substrate
