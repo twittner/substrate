@@ -7,7 +7,7 @@ stages:
   - test
   - build
   - publish
-  - label
+  - deploy
 
 image:                             parity/rust:nightly
 
@@ -88,14 +88,13 @@ test:rust:stable:                  &test
     - master
     - schedules
     - web
-    - /^pr-[0-9]+$/
     - /^[0-9]+$/
   tags:
     - linux-docker
   before_script:
-   - test -d ${CARGO_HOME} -a -d ./target && 
+   - test -d ${CARGO_HOME} -a -d ./target &&
      echo "build cache size:" &&
-     du -hs ${CARGO_HOME} ./target
+     du -h --max-depth=2 ${CARGO_HOME} ./target
    - ./scripts/build.sh
   script:
     - time cargo test --all --release --verbose --locked
@@ -126,9 +125,9 @@ build:rust:linux:release:          &build
     - mkdir -p ./artifacts
     - mv ./target/release/substrate ./artifacts/.
     - echo -n "Substrate version = "
-    - if [ "${CI_COMMIT_TAG}" ]; then 
+    - if [ "${CI_COMMIT_TAG}" ]; then
         echo "${CI_COMMIT_TAG}" | tee ./artifacts/VERSION;
-      else 
+      else
         ./artifacts/substrate --version |
         sed -n -r 's/^substrate ([0-9.]+.*-[0-9a-f]{7,13})-.*$/\1/p' |
         tee ./artifacts/VERSION;
@@ -223,11 +222,7 @@ publish:s3:doc:
   dependencies:
     - build:rust:doc:release
   cache: {}
-  only:
-    - master
-    - tags
-    - web
-    - publish-rustdoc
+  <<:                              *build_only
   variables:
     GIT_STRATEGY:                  none
     BUCKET:                        "releases.parity.io"
@@ -246,6 +241,60 @@ publish:s3:doc:
     - linux-docker
 
 
+
+
+
+
+
+.deploy:template:                  &deploy
+  stage:                           deploy
+  when:                            manual
+  cache:                           {}
+  retry:                           1
+  image:                           dtzar/helm-kubectl:$HELM_VERSION
+  only:
+    - master
+    - tags
+    - web
+    - kubernetes
+  variables:
+    DEPLOY_TAG:                    "latest"
+  tags:
+    - kubernetes
+  before_script:
+    - test -z "${DEPLOY_TAG}" &&
+      test -f ./target/release/VERSION &&
+      DEPLOY_TAG="$(cat ./target/release/VERSION)"
+    - test "${DEPLOY_TAG}" || ( echo "Neither DEPLOY_TAG nor VERSION information available"; exit 1 )
+  script:
+    - echo "Substrate version = ${DEPLOY_TAG}"
+    # or use helm to render the template
+    - helm template
+      --values ./scripts/kubernetes/values.yaml
+      --set image.tag=${DEPLOY_TAG}
+      ./scripts/kubernetes | kubectl apply -f - --dry-run=true
+    - echo "# substrate namespace"
+    - kubectl -n substrate get all
+    - echo "# substrate's nodes' external ip addresses:"
+    - kubectl get nodes -l node=substrate
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range @.status.addresses[?(@.type=="ExternalIP")]}{.address}{"\n"}{end}'
+    - echo "# substrate' nodes"
+    - kubectl -n substrate get pods
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.nodeName}{"\n"}{end}'
+
+
+
+# have environment:url eventually point to the logs
+
+deploy:ew3:
+  <<:                              *deploy
+  environment:
+    name: gke-beta-ew3
+
+deploy:ue1:
+  <<:                              *deploy
+  environment:
+    name: gke-beta-ue1
 
 
 
