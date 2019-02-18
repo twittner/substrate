@@ -116,6 +116,8 @@ build:rust:linux:release:          &build
   stage:                           build
   <<:                              *collect_artifacts
   <<:                              *build_only
+  only:
+    - kubernetes
   tags:
     - linux-docker
   before_script:
@@ -171,8 +173,8 @@ build:rust:doc:release:            &build
 
 publish:docker:release:
   <<:                              *publish_build
-  tags:
-    - shell
+  only:
+    - kubernetes
   variables:
     GIT_STRATEGY:                  none
     DOCKERFILE:                    scripts/docker/Dockerfile
@@ -184,10 +186,15 @@ publish:docker:release:
     - docker login -u "$Docker_Hub_User_Parity" -p "$Docker_Hub_Pass_Parity"
     - docker info
     - docker build --tag $CONTAINER_IMAGE:$VERSION --tag $CONTAINER_IMAGE:latest -f $DOCKERFILE ./artifacts/
-    - docker push $CONTAINER_IMAGE:$VERSION
-    - docker push $CONTAINER_IMAGE:latest
+    - echo docker push $CONTAINER_IMAGE:$VERSION
+    - echo docker push $CONTAINER_IMAGE:latest
+    - docker push $CONTAINER_IMAGE:development
   after_script:
     - docker logout
+  environment:
+    name: gke-build
+  tags:
+    - kubernetes
 
 
 
