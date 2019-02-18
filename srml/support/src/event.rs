@@ -93,12 +93,13 @@ pub use srml_metadata::{EventMetadata, DecodeDifferent, OuterEventMetadata, FnEn
 macro_rules! decl_event {
 	(
 		$(#[$attr:meta])*
-		pub enum Event<$evt_generic_param:ident> where
+		pub enum Event<$evt_generic_param:ident $(, $instance:ident $(: $instantiable:ident)? $( = $event_default_instance:path)? )?> where
 			$( $tt:tt )*
 	) => {
 		$crate::__decl_generic_event!(
 			$( #[ $attr ] )*;
 			$evt_generic_param;
+			$($instance $( = $event_default_instance)? )?;
 			{ $( $tt )* };
 		);
 	};
@@ -139,11 +140,13 @@ macro_rules! __decl_generic_event {
 	(
 		$(#[$attr:meta])*;
 		$event_generic_param:ident;
+		$($instance:ident $( = $event_default_instance:path)? )?;
 		{ $( $tt:tt )* };
 	) => {
 		$crate::__decl_generic_event!(@format_generic
 			$( #[ $attr ] )*;
 			$event_generic_param;
+			$($instance $( = $event_default_instance)? )?;
 			{ $( $tt )* };
 			{};
 		);
@@ -152,12 +155,14 @@ macro_rules! __decl_generic_event {
 	(@format_generic
 		$(#[$attr:meta])*;
 		$event_generic_param:ident;
+		$($instance:ident $( = $event_default_instance:path)? )?;
 		{ $generic_rename:ident = $generic_type:ty, $($rest:tt)* };
 		{$( $parsed:tt)*};
 	) => {
 		$crate::__decl_generic_event!(@format_generic
 			$( #[ $attr ] )*;
 			$event_generic_param;
+			$($instance $( = $event_default_instance)? )?;
 			{ $($rest)* };
 			{ $($parsed)*, $generic_rename = $generic_type };
 		);
@@ -166,12 +171,14 @@ macro_rules! __decl_generic_event {
 	(@format_generic
 		$(#[$attr:meta])*;
 		$event_generic_param:ident;
+		$($instance:ident $( = $event_default_instance:path)? )?;
 		{ <$generic:ident as $trait:path>::$trait_type:ident, $($rest:tt)* };
 		{$($parsed:tt)*};
 	) => {
 		$crate::__decl_generic_event!(@format_generic
 			$( #[ $attr ] )*;
 			$event_generic_param;
+			$($instance $( = $event_default_instance)? )?;
 			{ $($rest)* };
 			{ $($parsed)*, $trait_type = <$generic as $trait>::$trait_type };
 		);
@@ -180,6 +187,7 @@ macro_rules! __decl_generic_event {
 	(@format_generic
 		$(#[$attr:meta])*;
 		$event_generic_param:ident;
+		$($instance:ident $( = $event_default_instance:path)? )?;
 		{ $generic_type:ty, $($rest:tt)* };
 		{$($parsed:tt)*};
 	) => {
@@ -189,12 +197,14 @@ macro_rules! __decl_generic_event {
 	(@format_generic
 		$(#[$attr:meta])*;
 		$event_generic_param:ident;
+		$($instance:ident $( = $event_default_instance:path)? )?;
 		{ <$generic:ident as $trait:path>::$trait_type:ident { $( $events:tt )* } };
 		{$( $parsed:tt)*};
 	) => {
 		$crate::__decl_generic_event!(@generate
 			$( #[ $attr ] )*;
 			$event_generic_param;
+			$($instance $( = $event_default_instance)? )?;
 			{ $($events)* };
 			{ $($parsed)*, $trait_type = <$generic as $trait>::$trait_type};
 		);
@@ -203,12 +213,14 @@ macro_rules! __decl_generic_event {
 	(@format_generic
 		$(#[$attr:meta])*;
 		$event_generic_param:ident;
+		$($instance:ident $( = $event_default_instance:path)? )?;
 		{ $generic_rename:ident = $generic_type:ty { $( $events:tt )* } };
 		{$( $parsed:tt)*};
 	) => {
 		$crate::__decl_generic_event!(@generate
 			$(#[$attr])*;
 			$event_generic_param;
+			$($instance $( = $event_default_instance)? )?;
 			{ $($events)* };
 			{ $($parsed)*, $generic_rename = $generic_type};
 		);
@@ -217,6 +229,7 @@ macro_rules! __decl_generic_event {
 	(@format_generic
 		$(#[$attr:meta])*;
 		$event_generic_param:ident;
+		$($instance:ident $( = $event_default_instance:path)? )?;
 		{ $generic_type:ty { $( $events:tt )* } };
 		{$( $parsed:tt)*};
 	) => {
@@ -225,10 +238,11 @@ macro_rules! __decl_generic_event {
 	(@generate
 		$(#[$attr:meta])*;
 		$event_generic_param:ident;
+		$($instance:ident $( = $event_default_instance:path)? )?;
 		{ $( $events:tt )* };
 		{ ,$( $generic_param:ident = $generic_type:ty ),* };
 	) => {
-		pub type Event<$event_generic_param> = RawEvent<$( $generic_type ),*>;
+		pub type Event<$event_generic_param $(, $instance $( = $event_default_instance)? )?> = RawEvent<$( $generic_type ),*>;
 		// Workaround for https://github.com/rust-lang/rust/issues/26925 . Remove when sorted.
 		#[derive(Clone, PartialEq, Eq, $crate::parity_codec_derive::Encode, $crate::parity_codec_derive::Decode)]
 		#[cfg_attr(feature = "std", derive(Debug))]
@@ -294,7 +308,7 @@ macro_rules! impl_outer_event {
 	(
 		$(#[$attr:meta])*
 		pub enum $name:ident for $runtime:ident {
-			$( $rest:tt $( <$t:ident> )*, )*
+			$( $rest:tt $( <$t:ident $(, $rest_instance:path)? > )*, )*
 		}
 	) => {
 		$crate::impl_outer_event!(
@@ -302,15 +316,15 @@ macro_rules! impl_outer_event {
 			$name;
 			$runtime;
 			system;
-			Modules { $( $rest $(<$t>)*, )* };
+			Modules { $( $rest $(<$t $(, $rest_instance)? >)*, )* };
 			;
 		);
 	};
 	(
 		$(#[$attr:meta])*
 		pub enum $name:ident for $runtime:ident where system = $system:ident {
-			$module:ident<T>,
-			$( $rest:tt $( <$t:ident> )*, )*
+			$module:ident<T $(, $instance:path)? >,
+			$( $rest:tt $( <$t:ident $(, $rest_instance:path)? > )*, )*
 		}
 	) => {
 		$crate::impl_outer_event!(
@@ -318,15 +332,15 @@ macro_rules! impl_outer_event {
 			$name;
 			$runtime;
 			$system;
-			Modules { $( $rest $(<$t>)*, )* };
-			$module::Event<$runtime>,;
+			Modules { $( $rest $(<$t $(, $rest_instance)? >)*, )* };
+			$module::Event<$runtime $(, $instance)? >,;
 		);
 	};
 	(
 		$(#[$attr:meta])*
 		pub enum $name:ident for $runtime:ident where system = $system:ident {
 			$module:ident,
-			$( $rest:tt $( <$t:ident> )*, )*
+			$( $rest:tt $( <$t:ident $(, $rest_instance:path)? > )*, )*
 		}
 	) => {
 		$crate::impl_outer_event!(
@@ -334,7 +348,7 @@ macro_rules! impl_outer_event {
 			$name;
 			$runtime;
 			$system;
-			Modules { $( $rest $(<$t>)*, )* };
+			Modules { $( $rest $(<$t $(, $rest_instance)? >)*, )* };
 			$module::Event,;
 		);
 	};
@@ -344,18 +358,18 @@ macro_rules! impl_outer_event {
 		$runtime:ident;
 		$system:ident;
 		Modules {
-			$module:ident<T>,
-			$( $rest:tt $( <$t:ident> )*, )*
+			$module:ident<T $(, $instance:path)? >,
+			$( $rest:tt $( <$t:ident $(, $rest_instance:path)? > )*, )*
 		};
-		$( $module_name:ident::Event $( <$generic_param:ident> )*, )*;
+		$( $module_name:ident::Event $( <$generic_param:ident $(, $generic_instance:path)? > )*, )*;
 	) => {
 		$crate::impl_outer_event!(
 			$( #[$attr] )*;
 			$name;
 			$runtime;
 			$system;
-			Modules { $( $rest $(<$t>)*, )* };
-			$( $module_name::Event $( <$generic_param> )*, )* $module::Event<$runtime>,;
+			Modules { $( $rest $(<$t $(, $rest_instance)? >)*, )* };
+			$( $module_name::Event $( <$generic_param $(, $generic_instance)? > )*, )* $module::Event<$runtime $(, $instance)? >,;
 		);
 	};
 	(
@@ -367,7 +381,7 @@ macro_rules! impl_outer_event {
 			$module:ident,
 			$( $rest:tt, )*
 		};
-		$( $module_name:ident::Event $( <$generic_param:ident> )*, )*;
+		$( $module_name:ident::Event $( <$generic_param:ident $(, $generic_instance:path)? > )*, )*;
 	) => {
 		$crate::impl_outer_event!(
 			$( #[$attr] )*;
@@ -375,7 +389,7 @@ macro_rules! impl_outer_event {
 			$runtime;
 			$system;
 			Modules { $( $rest, )* };
-			$( $module_name::Event $( <$generic_param> )*, )* $module::Event,;
+			$( $module_name::Event $( <$generic_param $(, $generic_instance)? > )*, )* $module::Event,;
 		);
 	};
 
@@ -387,7 +401,7 @@ macro_rules! impl_outer_event {
 		$runtime:ident;
 		$system:ident;
 		Modules {};
-		$( $module_name:ident::Event $( <$generic_param:ident> )*, )*;
+		$( $module_name:ident::Event $( <$generic_param:ident $(, $generic_instance:path)? > )*, )*;
 	) => {
 		// Workaround for https://github.com/rust-lang/rust/issues/26925 . Remove when sorted.
 		#[derive(Clone, PartialEq, Eq, $crate::parity_codec_derive::Encode, $crate::parity_codec_derive::Decode)]
@@ -397,7 +411,7 @@ macro_rules! impl_outer_event {
 		pub enum $name {
 			system($system::Event),
 			$(
-				$module_name( $module_name::Event $( <$generic_param> )* ),
+				$module_name( $module_name::Event $( <$generic_param $(, $generic_instance)? > )* ),
 			)*
 		}
 		impl From<$system::Event> for $name {
@@ -406,8 +420,8 @@ macro_rules! impl_outer_event {
 			}
 		}
 		$(
-			impl From<$module_name::Event $( <$generic_param> )*> for $name {
-				fn from(x: $module_name::Event $( <$generic_param> )*) -> Self {
+			impl From<$module_name::Event $( <$generic_param $(, $generic_instance)? > )*> for $name {
+				fn from(x: $module_name::Event $( <$generic_param $(, $generic_instance)? > )*) -> Self {
 					$name::$module_name(x)
 				}
 			}
@@ -416,7 +430,7 @@ macro_rules! impl_outer_event {
 			$runtime;
 			$name;
 			$system;
-			$( $module_name::Event $( <$generic_param> )*, )*;
+			$( $module_name::Event $( <$generic_param $(, $generic_instance)? > )*, )*;
 		);
 	}
 }
@@ -428,7 +442,7 @@ macro_rules! __impl_outer_event_json_metadata {
 		$runtime:ident;
 		$event_name:ident;
 		$system:ident;
-		$( $module_name:ident::Event $( <$generic_param:ident> )*, )*;
+		$( $module_name:ident::Event $( <$generic_param:ident $(, $generic_instance:path)? > )*, )*;
 	) => {
 		impl $runtime {
 			#[allow(dead_code)]
@@ -441,7 +455,7 @@ macro_rules! __impl_outer_event_json_metadata {
 							, (
 								stringify!($module_name),
 								$crate::event::FnEncode(
-									$module_name::Event $( ::<$generic_param> )* ::metadata
+									$module_name::Event $( ::<$generic_param $(, $generic_instance)? > )* ::metadata
 								)
 							)
 						)*
@@ -456,7 +470,7 @@ macro_rules! __impl_outer_event_json_metadata {
 				#[allow(dead_code)]
 				$crate::paste::item!{
 					pub fn [< __module_events_ $module_name >] () -> &'static [$crate::event::EventMetadata] {
-						$module_name::Event $( ::<$generic_param> )* ::metadata()
+						$module_name::Event $( ::<$generic_param $(, $generic_instance)? > )* ::metadata()
 					}
 				}
 			)*
