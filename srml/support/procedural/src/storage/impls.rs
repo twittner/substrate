@@ -275,6 +275,7 @@ impl<'a> Impls<'a> {
 		};
 
 		// TODO TODO: test this with instance
+		// TODO TODO: rebase on tomek
 
 		// generator for linked map
 		//
