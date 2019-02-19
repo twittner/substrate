@@ -52,7 +52,6 @@ check:merge:conflict:
   cache:                           {}
   <<:                              *kubernetes_build
   only:
-    - kubernetes
     - /^[0-9]+$/
   variables:
     GITHUB_API:                    "https://api.github.com"
@@ -72,7 +71,6 @@ check:runtime:
   cache:                           {}
   <<:                              *kubernetes_build
   only:
-    - kubernetes
     - /^[0-9]+$/
   variables:
     GITLAB_API:                    "https://gitlab.parity.io/api/v4"
