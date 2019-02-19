@@ -36,15 +36,23 @@ cache:
 
 
 
+.kubernetes_build:                 &kubernetes_build
+  tags:
+    - kubernetes
+  environment:
+    name: gke-build
+
+
+
 #### stage:                        merge-test
 
 check:merge:conflict:
   stage:                           merge-test
   image:                           parity/tools:latest
   cache:                           {}
-  tags:
-    - linux-docker
+  <<:                              *kubernetes_build
   only:
+    - kubernetes
     - /^[0-9]+$/
   variables:
     GITHUB_API:                    "https://api.github.com"
@@ -62,9 +70,9 @@ check:runtime:
   stage:                           test
   image:                           parity/tools:latest
   cache:                           {}
-  tags:
-    - linux-docker
+  <<:                              *kubernetes_build
   only:
+    - kubernetes
     - /^[0-9]+$/
   variables:
     GITLAB_API:                    "https://gitlab.parity.io/api/v4"
@@ -83,14 +91,14 @@ test:rust:stable:                  &test
     # but still want to have debug assertions.
     RUSTFLAGS: -Cdebug-assertions=y
     TARGET: native
+  <<:                              *kubernetes_build
   only:
+    - kubernetes
     - tags
     - master
     - schedules
     - web
     - /^[0-9]+$/
-  tags:
-    - linux-docker
   before_script:
    - test -d ${CARGO_HOME} -a -d ./target &&
      echo "build cache size:" &&
@@ -116,8 +124,6 @@ build:rust:linux:release:          &build
   stage:                           build
   <<:                              *collect_artifacts
   <<:                              *build_only
-  only:
-    - kubernetes
   tags:
     - linux-docker
   before_script:
@@ -170,13 +176,12 @@ build:rust:doc:release:            &build
     - build:rust:linux:release
   cache: {}
   <<:                              *build_only
+  <<:                              *kubernetes_build
 
 
 
 publish:docker:release:
   <<:                              *publish_build
-  only:
-    - kubernetes
   image:                           docker:stable
   services:
     - docker:dind
@@ -194,15 +199,10 @@ publish:docker:release:
     - docker info
     - cd ./artifacts
     - docker build --tag $CONTAINER_IMAGE:$VERSION --tag $CONTAINER_IMAGE:latest .
-    - echo docker push $CONTAINER_IMAGE:$VERSION
-    - echo docker push $CONTAINER_IMAGE:latest
-    - docker push $CONTAINER_IMAGE:development
+    - docker push $CONTAINER_IMAGE:$VERSION
+    - docker push $CONTAINER_IMAGE:latest
   after_script:
     - docker logout
-  environment:
-    name: gke-build
-  tags:
-    - kubernetes
 
 
 
@@ -227,8 +227,6 @@ publish:s3:release:
   after_script:
     - aws s3 ls s3://${BUCKET}/${PREFIX}/latest/
         --recursive --human-readable --summarize
-  tags:
-    - linux-docker
 
 
 
@@ -238,6 +236,7 @@ publish:s3:doc:
     - build:rust:doc:release
   cache: {}
   <<:                              *build_only
+  <<:                              *kubernetes_build
   variables:
     GIT_STRATEGY:                  none
     BUCKET:                        "releases.parity.io"
@@ -252,8 +251,6 @@ publish:s3:doc:
   after_script:
     - aws s3 ls s3://${BUCKET}/${PREFIX}/
         --human-readable --summarize
-  tags:
-    - linux-docker
 
 
 
