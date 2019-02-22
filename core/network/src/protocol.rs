@@ -33,9 +33,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::{cmp, num::NonZeroUsize, thread, time};
 use log::{trace, debug, warn};
-use crate::chain::Client;
 use client::light::fetcher::ChangesProof;
-use crate::{error, util::LruHashSet};
+use crate::{chain::Client, error, util::LruHashSet};
 
 const REQUEST_TIMEOUT_SEC: u64 = 40;
 const TICK_TIMEOUT: time::Duration = time::Duration::from_millis(1000);
@@ -85,14 +84,14 @@ struct Peer<B: BlockT, H: ExHashT> {
 	info: PeerInfo<B>,
 	/// Current block request, if any.
 	block_request: Option<(time::Instant, message::BlockRequest<B>)>,
-	/// Requests we are no longer insterested in.
-	obsolete_requests: HashMap<message::RequestId, time::Instant>,
 	/// Holds a set of transactions known to this peer.
 	known_extrinsics: LruHashSet<H>,
 	/// Holds a set of blocks known to this peer.
 	known_blocks: LruHashSet<B::Hash>,
-	/// Request counter,
-	next_request_id: message::RequestId,
+	/// ID of the request we expect a response for.
+	request_id: message::RequestId,
+	/// The most recent response ID from remote.
+	response_id: message::RequestId,
 }
 
 /// Info about a peer's known state.
@@ -370,15 +369,29 @@ impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> Protocol<B, S, H> {
 
 	fn handle_response(&mut self, who: NodeIndex, response: &message::BlockResponse<B>) -> Option<message::BlockRequest<B>> {
 		if let Some(ref mut peer) = self.context_data.peers.get_mut(&who) {
-			if let Some(_) = peer.obsolete_requests.remove(&response.id) {
-				trace!(target: "sync", "Ignoring obsolete block response packet from {} ({})", who, response.id,);
+			// Make sure the peer is not repeating responses it has already sent to us and punish the peer if it does.
+			if response.id <= peer.response_id {
+				trace!(target: "sync", "Invalid response from {}: {} <= {}", who, response.id, peer.response_id);
+				let severity = Severity::Bad("Repeated response packet received from peer.".to_string());
+				self.network_chan.send(NetworkMsg::ReportPeer(who, severity));
+				return None
+			}
+
+			peer.response_id = response.id;
+
+			// Ignore obsolete responses.
+			if response.id < peer.request_id {
+				trace!(target: "sync", "Ignoring obsolete block response packet from {} ({:?})", who, response.id,);
 				return None;
 			}
+
 			// Clear the request. If the response is invalid peer will be disconnected anyway.
-			let request = peer.block_request.take();
-			if request.as_ref().map_or(false, |(_, r)| r.id == response.id) {
-				return request.map(|(_, r)| r)
+			if let Some(request) = peer.block_request.take() {
+				if request.1.id == response.id {
+					return Some(request.1)
+				}
 			}
+
 			trace!(target: "sync", "Unexpected response packet from {} ({})", who, response.id,);
 			let severity = Severity::Bad("Unexpected response packet received from peer".to_string());
 			self.network_chan.send(NetworkMsg::ReportPeer(who, severity))
@@ -611,10 +624,7 @@ impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> Protocol<B, S, H> {
 		{
 			for (who, peer) in self.context_data.peers.iter() {
 				if peer.block_request.as_ref().map_or(false, |(t, _)| (tick - *t).as_secs() > REQUEST_TIMEOUT_SEC) {
-					trace!(target: "sync", "Reqeust timeout {}", who);
-					aborting.push(*who);
-				} else if peer.obsolete_requests.values().any(|t| (tick - *t).as_secs() > REQUEST_TIMEOUT_SEC) {
-					trace!(target: "sync", "Obsolete timeout {}", who);
+					trace!(target: "sync", "Request timeout {}", who);
 					aborting.push(*who);
 				}
 			}
@@ -695,8 +705,8 @@ impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> Protocol<B, S, H> {
 				block_request: None,
 				known_extrinsics: LruHashSet::new(cache_limit),
 				known_blocks: LruHashSet::new(cache_limit),
-				next_request_id: 0,
-				obsolete_requests: HashMap::new(),
+				request_id: message::RequestId::default(),
+				response_id: message::RequestId::default()
 			};
 			self.context_data.peers.insert(who.clone(), peer);
 			self.handshaking_peers.remove(&who);
@@ -1037,11 +1047,10 @@ fn send_message<B: BlockT, H: ExHashT>(
 ) {
 	if let GenericMessage::BlockRequest(ref mut r) = message {
 		if let Some(ref mut peer) = peers.get_mut(&who) {
-			r.id = peer.next_request_id;
-			peer.next_request_id = peer.next_request_id + 1;
-			if let Some((timestamp, request)) = peer.block_request.take() {
-				trace!(target: "sync", "Request {} for {} is now obsolete.", request.id, who);
-				peer.obsolete_requests.insert(request.id, timestamp);
+			peer.request_id = peer.request_id.next();
+			r.id = peer.request_id;
+			if let Some((_, request)) = peer.block_request.take() {
+				trace!(target: "sync", "Request {} for {} is now obsolete.", request.id, who)
 			}
 			peer.block_request = Some((time::Instant::now(), r.clone()));
 		}

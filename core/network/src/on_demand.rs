@@ -30,7 +30,7 @@ use client::light::fetcher::{Fetcher, FetchChecker, RemoteHeaderRequest,
 	RemoteCallRequest, RemoteReadRequest, RemoteChangesRequest, ChangesProof};
 use crate::message;
 use network_libp2p::{Severity, NodeIndex};
-use crate::config::Roles;
+use crate::{config::Roles, message::RequestId};
 use crate::service::{NetworkChan, NetworkMsg};
 use runtime_primitives::traits::{Block as BlockT, Header as HeaderT, NumberFor};
 
@@ -88,7 +88,7 @@ pub struct RemoteResponse<T> {
 
 #[derive(Default)]
 struct OnDemandCore<B: BlockT> {
-	next_request_id: u64,
+	next_request_id: RequestId,
 	pending_requests: VecDeque<Request<B>>,
 	active_peers: LinkedHashMap<NodeIndex, Request<B>>,
 	idle_peers: VecDeque<NodeIndex>,
@@ -96,7 +96,7 @@ struct OnDemandCore<B: BlockT> {
 }
 
 struct Request<Block: BlockT> {
-	id: u64,
+	id: RequestId,
 	timestamp: Instant,
 	retry_count: usize,
 	data: RequestData<Block>,
@@ -139,7 +139,7 @@ impl<B: BlockT> OnDemand<B> where
 			checker,
 			network_sender: Mutex::new(None),
 			core: Mutex::new(OnDemandCore {
-				next_request_id: 0,
+				next_request_id: RequestId::default(),
 				pending_requests: VecDeque::new(),
 				active_peers: LinkedHashMap::new(),
 				idle_peers: VecDeque::new(),
@@ -170,7 +170,13 @@ impl<B: BlockT> OnDemand<B> where
 	}
 
 	/// Try to accept response from given peer.
-	fn accept_response<F: FnOnce(Request<B>) -> Accept<B>>(&self, rtype: &str, peer: NodeIndex, request_id: u64, try_accept: F) {
+	fn accept_response<F: FnOnce(Request<B>) -> Accept<B>>(
+		&self,
+		rtype: &str,
+		peer: NodeIndex,
+		request_id: RequestId,
+		try_accept: F
+	) {
 		let mut core = self.core.lock();
 		let request = match core.remove(peer, request_id) {
 			Some(request) => request,
@@ -388,18 +394,16 @@ impl<B> OnDemandCore<B> where
 	}
 
 	pub fn insert(&mut self, retry_count: usize, data: RequestData<B>) {
-		let request_id = self.next_request_id;
-		self.next_request_id += 1;
-
 		self.pending_requests.push_back(Request {
-			id: request_id,
+			id: self.next_request_id,
 			timestamp: Instant::now(),
 			retry_count,
 			data,
 		});
+		self.next_request_id = self.next_request_id.next()
 	}
 
-	pub fn remove(&mut self, peer: NodeIndex, id: u64) -> Option<Request<B>> {
+	pub fn remove(&mut self, peer: NodeIndex, id: RequestId) -> Option<Request<B>> {
 		match self.active_peers.entry(peer) {
 			Entry::Occupied(entry) => match entry.get().id == id {
 				true => {
@@ -531,7 +535,7 @@ pub mod tests {
 	use client::light::fetcher::{Fetcher, FetchChecker, RemoteHeaderRequest,
 		RemoteCallRequest, RemoteReadRequest, RemoteChangesRequest, ChangesProof};
 	use crate::config::Roles;
-	use crate::message;
+	use crate::message::{self, RequestId};
 	use network_libp2p::{NodeIndex, ProtocolId, Severity};
 	use crate::service::{network_channel, NetworkPort, NetworkMsg};
 	use super::{REQUEST_TIMEOUT, OnDemand, OnDemandService};
@@ -682,7 +686,7 @@ pub mod tests {
 			call_data: vec![],
 			retry_count: None,
 		});
-		receive_call_response(&*on_demand, 0, 1);
+		receive_call_response(&*on_demand, 0, RequestId::default().next());
 		assert_disconnected_peer(network_port, Severity::Bad("Invalid remote call response from peer".to_string()));
 		assert_eq!(on_demand.core.lock().pending_requests.len(), 1);
 	}
@@ -701,7 +705,7 @@ pub mod tests {
 		});
 
 		on_demand.on_connect(0, Roles::FULL, 1000);
-		receive_call_response(&*on_demand, 0, 0);
+		receive_call_response(&*on_demand, 0, RequestId::default());
 		assert_disconnected_peer(network_port, Severity::Bad("Failed to check remote call response from peer: Backend error: Test error".to_string()));
 		assert_eq!(on_demand.core.lock().pending_requests.len(), 1);
 	}
@@ -713,7 +717,7 @@ pub mod tests {
 		on_demand.set_network_sender(network_sender.clone());
 		on_demand.on_connect(0, Roles::FULL, 1000);
 
-		receive_call_response(&*on_demand, 0, 0);
+		receive_call_response(&*on_demand, 0, RequestId::default());
 		assert_disconnected_peer(network_port, Severity::Bad("Invalid remote call response from peer".to_string()));
 	}
 
@@ -733,7 +737,7 @@ pub mod tests {
 		});
 
 		on_demand.on_remote_read_response(0, message::RemoteReadResponse {
-			id: 0,
+			id: RequestId::default(),
 			proof: vec![vec![2]],
 		});
 		assert_disconnected_peer(network_port, Severity::Bad("Unexpected response to remote read from peer".to_string()));
@@ -770,10 +774,12 @@ pub mod tests {
 		});
 
 		let &(ref current, ref finished_at, ref finished) = &*sync;
-		for i in 0..retry_count+1 {
+		let mut id = RequestId::default();
+		for i in 0 ..= retry_count {
 			let mut current = current.lock();
 			*current = *current + 1;
-			receive_call_response(&*on_demand, i, i as u64);
+			receive_call_response(&*on_demand, i, id);
+			id = id.next()
 		}
 
 		let mut finished_at = finished_at.lock();
@@ -802,7 +808,7 @@ pub mod tests {
 			assert_eq!(result, vec![42]);
 		});
 
-		receive_call_response(&*on_demand, 0, 0);
+		receive_call_response(&*on_demand, 0, RequestId::default());
 		thread.join().unwrap();
 	}
 
@@ -825,7 +831,7 @@ pub mod tests {
 		});
 
 		on_demand.on_remote_read_response(0, message::RemoteReadResponse {
-			id: 0,
+			id: RequestId::default(),
 			proof: vec![vec![2]],
 		});
 		thread.join().unwrap();
@@ -853,7 +859,7 @@ pub mod tests {
 		});
 
 		on_demand.on_remote_header_response(0, message::RemoteHeaderResponse {
-			id: 0,
+			id: RequestId::default(),
 			header: Some(Header {
 				parent_hash: Default::default(),
 				number: 1,
@@ -888,7 +894,7 @@ pub mod tests {
 		});
 
 		on_demand.on_remote_changes_response(0, message::RemoteChangesResponse {
-			id: 0,
+			id: RequestId::default(),
 			max: 1000,
 			proof: vec![vec![2]],
 			roots: vec![],
@@ -937,7 +943,7 @@ pub mod tests {
 		assert_eq!(on_demand.core.lock().pending_requests.len(), 1);
 
 		on_demand.on_remote_header_response(1, message::RemoteHeaderResponse {
-			id: 0,
+			id: RequestId::default(),
 			header: Some(dummy_header()),
 			proof: vec![],
 		});

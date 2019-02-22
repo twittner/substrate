@@ -28,7 +28,7 @@ use crate::blocks::BlockCollection;
 use runtime_primitives::Justification;
 use runtime_primitives::traits::{Block as BlockT, Header as HeaderT, As, NumberFor};
 use runtime_primitives::generic::BlockId;
-use crate::message::{self, generic::Message as GenericMessage};
+use crate::message::{self, generic::Message as GenericMessage, RequestId};
 use crate::config::Roles;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -168,7 +168,7 @@ impl<B: BlockT> PendingJustifications<B> {
 
 			trace!(target: "sync", "Requesting justification for block #{} from {}", request.0, peer);
 			let request = message::generic::BlockRequest {
-				id: 0,
+				id: RequestId::default(),
 				fields: message::BlockAttributes::JUSTIFICATION,
 				from: message::FromBlock::Hash(request.0),
 				to: None,
@@ -784,7 +784,7 @@ impl<B: BlockT> ChainSync<B> {
 			match peer.state {
 				PeerSyncState::Available => {
 					let request = message::generic::BlockRequest {
-						id: 0,
+						id: RequestId::default(),
 						fields: self.required_block_attributes.clone(),
 						from: message::FromBlock::Hash(*hash),
 						to: None,
@@ -805,7 +805,7 @@ impl<B: BlockT> ChainSync<B> {
 			match peer.state {
 				PeerSyncState::Available => {
 					let request = message::generic::BlockRequest {
-						id: 0,
+						id: RequestId::default(),
 						fields: self.required_block_attributes.clone(),
 						from: message::FromBlock::Hash(*hash),
 						to: None,
@@ -835,7 +835,7 @@ impl<B: BlockT> ChainSync<B> {
 					if let Some(range) = self.blocks.needed_blocks(who, MAX_BLOCKS_TO_REQUEST, peer.best_number, peer.common_number) {
 						trace!(target: "sync", "Requesting blocks from {}, ({} to {})", who, range.start, range.end);
 						let request = message::generic::BlockRequest {
-							id: 0,
+							id: RequestId::default(),
 							fields: self.required_block_attributes.clone(),
 							from: message::FromBlock::Number(range.start),
 							to: None,
@@ -856,7 +856,7 @@ impl<B: BlockT> ChainSync<B> {
 	fn request_ancestry(protocol: &mut Context<B>, who: NodeIndex, block: NumberFor<B>) {
 		trace!(target: "sync", "Requesting ancestry block #{} from {}", block, who);
 		let request = message::generic::BlockRequest {
-			id: 0,
+			id: RequestId::default(),
 			fields: message::BlockAttributes::HEADER | message::BlockAttributes::JUSTIFICATION,
 			from: message::FromBlock::Number(block),
 			to: None,

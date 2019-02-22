@@ -26,9 +26,36 @@ pub use self::generic::{
 	RemoteChangesRequest, RemoteChangesResponse,
 	FromBlock
 };
+use std::fmt;
 
 /// A unique ID of a request.
-pub type RequestId = u64;
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RequestId(u64);
+
+impl RequestId {
+	/// Get the next request ID.
+	pub fn next(self) -> Self {
+		Self(self.0 + 1)
+	}
+}
+
+impl fmt::Display for RequestId {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+		self.0.fmt(f)
+	}
+}
+
+impl Encode for RequestId {
+	fn using_encoded<R, F: FnOnce(&[u8]) -> R>(&self, f: F) -> R {
+		self.0.using_encoded(f)
+	}
+}
+
+impl Decode for RequestId {
+	fn decode<I: Input>(value: &mut I) -> Option<Self> {
+		u64::decode(value).map(RequestId)
+	}
+}
 
 /// Consensus engine unique ID.
 pub type ConsensusEngineId = [u8; 4];
