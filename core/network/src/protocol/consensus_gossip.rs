@@ -34,6 +34,7 @@ use crate::config::Roles;
 // FIXME: Add additional spam/DoS attack protection: https://github.com/paritytech/substrate/issues/1115
 const KNOWN_MESSAGES_CACHE_SIZE: usize = 4096;
 
+/// After which all message entries are re-broadcasted.
 const REBROADCAST_INTERVAL: time::Duration = time::Duration::from_secs(30);
 /// Reputation change when a peer sends us a gossip message that we didn't know about.
 const GOSSIP_SUCCESS_REPUTATION_CHANGE: i32 = 1 << 4;
@@ -45,11 +46,6 @@ const UNKNOWN_GOSSIP_REPUTATION_CHANGE: i32 = -(1 << 6);
 /// Reputation change when a peer sends a message from a topic it isn't registered on.
 const UNREGISTERED_TOPIC_REPUTATION_CHANGE: i32 = -(1 << 10);
 
-struct PeerConsensus<H> {
-	known_messages: HashSet<H>,
-	roles: Roles,
-}
-
 /// Topic stream message with sender.
 #[derive(Debug, Eq, PartialEq)]
 pub struct TopicNotification {
@@ -59,13 +55,8 @@ pub struct TopicNotification {
 	pub sender: Option<PeerId>,
 }
 
-struct MessageEntry<B: BlockT> {
-	message_hash: B::Hash,
-	topic: B::Hash,
-	message: ConsensusMessage,
-}
-
 /// Consensus message destination.
+#[derive(Debug, PartialEq, Eq)]
 pub enum MessageRecipient {
 	/// Send to all peers.
 	BroadcastToAll,
@@ -87,6 +78,7 @@ pub enum MessageIntent {
 }
 
 /// Message validation result.
+#[derive(Debug)]
 pub enum ValidationResult<H> {
 	/// Message should be stored and propagated under given topic.
 	ProcessAndKeep(H),
@@ -108,6 +100,28 @@ pub trait ValidatorContext<B: BlockT> {
 	fn send_topic(&mut self, who: &PeerId, topic: B::Hash, force: bool);
 }
 
+/// Validates consensus messages.
+pub trait Validator<B: BlockT>: Send + Sync {
+	/// Validate consensus message.
+	fn validate(&self, ctx: &mut dyn ValidatorContext<B>, sender: &PeerId, data: &[u8]) -> ValidationResult<B::Hash>;
+
+	/// New peer is connected.
+	fn new_peer(&self, _ctx: &mut dyn ValidatorContext<B>, _who: &PeerId, _roles: Roles) { }
+
+	/// New connection is dropped.
+	fn peer_disconnected(&self, _ctx: &mut dyn ValidatorContext<B>, _who: &PeerId) { }
+
+	/// Produce a closure for validating messages on a given topic.
+	fn message_expired<'a>(&'a self) -> Box<dyn FnMut(B::Hash, &[u8]) -> bool + 'a> {
+		Box::new(|_topic, _data| false)
+	}
+
+	/// Produce a closure for filtering egress messages.
+	fn message_allowed<'a>(&'a self) -> Box<dyn FnMut(&PeerId, MessageIntent, &B::Hash, &[u8]) -> bool + 'a> {
+		Box::new(|_who, _intent, _topic, _data| true)
+	}
+}
+
 struct NetworkContext<'g, 'p, B: BlockT> {
 	gossip: &'g mut ConsensusGossip<B>,
 	protocol: &'p mut dyn Context<B>,
@@ -117,25 +131,18 @@ struct NetworkContext<'g, 'p, B: BlockT> {
 impl<'g, 'p, B: BlockT> ValidatorContext<B> for NetworkContext<'g, 'p, B> {
 	/// Broadcast all messages with given topic to peers that do not have it yet.
 	fn broadcast_topic(&mut self, topic: B::Hash, force: bool) {
-		self.gossip.broadcast_topic(self.protocol, topic, force);
+		self.gossip.broadcast_topic(self.protocol, topic, force)
 	}
 
 	/// Broadcast a message to all peers that have not received it previously.
 	fn broadcast_message(&mut self, topic: B::Hash, message: Vec<u8>, force: bool) {
-		self.gossip.multicast(
-			self.protocol,
-			topic,
-			ConsensusMessage{ data: message, engine_id: self.engine_id.clone() },
-			force,
-		);
+		let msg = ConsensusMessage{ data: message, engine_id: self.engine_id.clone() };
+		self.gossip.multicast(self.protocol, topic, msg, force)
 	}
 
 	/// Send addressed message to a peer.
 	fn send_message(&mut self, who: &PeerId, message: Vec<u8>) {
-		self.protocol.send_consensus(who.clone(), ConsensusMessage {
-			engine_id: self.engine_id,
-			data: message,
-		});
+		self.protocol.send_consensus(who.clone(), ConsensusMessage { engine_id: self.engine_id, data: message });
 	}
 
 	/// Send all messages with given topic to a peer.
@@ -197,33 +204,19 @@ fn propagate<'a, B: BlockT, I>(
 	}
 }
 
-/// Validates consensus messages.
-pub trait Validator<B: BlockT>: Send + Sync {
-	/// New peer is connected.
-	fn new_peer(&self, _context: &mut dyn ValidatorContext<B>, _who: &PeerId, _roles: Roles) {
-	}
+/// Message representation.
+struct MessageEntry<B: BlockT> {
+	message_hash: B::Hash,
+	topic: B::Hash,
+	message: ConsensusMessage,
+}
 
-	/// New connection is dropped.
-	fn peer_disconnected(&self, _context: &mut dyn ValidatorContext<B>, _who: &PeerId) {
-	}
-
-	/// Validate consensus message.
-	fn validate(
-		&self,
-		context: &mut dyn ValidatorContext<B>,
-		sender: &PeerId,
-		data: &[u8]
-	) -> ValidationResult<B::Hash>;
-
-	/// Produce a closure for validating messages on a given topic.
-	fn message_expired<'a>(&'a self) -> Box<dyn FnMut(B::Hash, &[u8]) -> bool + 'a> {
-		Box::new(move |_topic, _data| false)
-	}
-
-	/// Produce a closure for filtering egress messages.
-	fn message_allowed<'a>(&'a self) -> Box<dyn FnMut(&PeerId, MessageIntent, &B::Hash, &[u8]) -> bool + 'a> {
-		Box::new(move |_who, _intent, _topic, _data| true)
-	}
+/// The assumed consensus view of some peer.
+struct PeerConsensus<H> {
+	/// The messages the peer is assumed to know about.
+	known_messages: HashSet<H>,
+	/// The peer roles.
+	roles: Roles,
 }
 
 /// Consensus network protocol handler. Manages statements and candidate requests.
@@ -244,7 +237,7 @@ impl<B: BlockT> ConsensusGossip<B> {
 			live_message_sinks: HashMap::new(),
 			messages: Default::default(),
 			known_messages: LruCache::new(KNOWN_MESSAGES_CACHE_SIZE),
-			validators: Default::default(),
+			validators: HashMap::default(),
 			next_broadcast: time::Instant::now() + REBROADCAST_INTERVAL,
 		}
 	}
@@ -255,36 +248,25 @@ impl<B: BlockT> ConsensusGossip<B> {
 	}
 
 	/// Register message validator for a message type.
-	pub fn register_validator(
-		&mut self,
-		protocol: &mut dyn Context<B>,
-		engine_id: ConsensusEngineId,
-		validator: Arc<dyn Validator<B>>
-	) {
-		self.register_validator_internal(engine_id, validator.clone());
-		let peers: Vec<_> = self.peers.iter().map(|(id, peer)| (id.clone(), peer.roles)).collect();
+	pub fn register_validator(&mut self, ctx: &mut dyn Context<B>, eid: ConsensusEngineId, val: Arc<dyn Validator<B>>) {
+		self.validators.insert(eid, val.clone());
+		let peers = self.peers.iter().map(|(id, peer)| (id.clone(), peer.roles)).collect::<Vec<_>>();
+		let mut context = NetworkContext { gossip: self, protocol: ctx, engine_id: eid };
 		for (id, roles) in peers {
-			let mut context = NetworkContext { gossip: self, protocol, engine_id: engine_id.clone() };
-			validator.new_peer(&mut context, &id, roles);
+			val.new_peer(&mut context, &id, roles);
 		}
-	}
-
-	fn register_validator_internal(&mut self, engine_id: ConsensusEngineId, validator: Arc<dyn Validator<B>>) {
-		self.validators.insert(engine_id, validator.clone());
 	}
 
 	/// Handle new connected peer.
 	pub fn new_peer(&mut self, protocol: &mut dyn Context<B>, who: PeerId, roles: Roles) {
 		// light nodes are not valid targets for consensus gossip messages
 		if !roles.is_full() {
-			return;
+			return
 		}
 
 		trace!(target:"gossip", "Registering {:?} {}", roles, who);
-		self.peers.insert(who.clone(), PeerConsensus {
-			known_messages: HashSet::new(),
-			roles,
-		});
+		self.peers.insert(who.clone(), PeerConsensus { known_messages: HashSet::new(), roles });
+
 		for (engine_id, v) in self.validators.clone() {
 			let mut context = NetworkContext { gossip: self, protocol, engine_id: engine_id.clone() };
 			v.new_peer(&mut context, &who, roles);
@@ -622,12 +604,12 @@ mod tests {
 		consensus.known_messages.insert(m2_hash, ());
 
 		let test_engine_id = Default::default();
-		consensus.register_validator_internal(test_engine_id, Arc::new(AllowAll));
+		consensus.validators.insert(test_engine_id, Arc::new(AllowAll));
 		consensus.collect_garbage();
 		assert_eq!(consensus.messages.len(), 2);
 		assert_eq!(consensus.known_messages.len(), 2);
 
-		consensus.register_validator_internal(test_engine_id, Arc::new(AllowOne));
+		consensus.validators.insert(test_engine_id, Arc::new(AllowOne));
 
 		// m2 is expired
 		consensus.collect_garbage();
@@ -642,7 +624,7 @@ mod tests {
 		use futures::Stream;
 
 		let mut consensus = ConsensusGossip::<Block>::new();
-		consensus.register_validator_internal([0, 0, 0, 0], Arc::new(AllowAll));
+		consensus.validators.insert([0, 0, 0, 0], Arc::new(AllowAll));
 
 		let message = ConsensusMessage { data: vec![4, 5, 6], engine_id: [0, 0, 0, 0] };
 		let topic = HashFor::<Block>::hash(&[1,2,3]);
@@ -670,7 +652,7 @@ mod tests {
 	#[test]
 	fn can_keep_multiple_subscribers_per_topic() {
 		let mut consensus = ConsensusGossip::<Block>::new();
-		consensus.register_validator_internal([0, 0, 0, 0], Arc::new(AllowAll));
+		consensus.validators.insert([0, 0, 0, 0], Arc::new(AllowAll));
 
 		let message = ConsensusMessage { data: vec![4, 5, 6], engine_id: [0, 0, 0, 0] };
 		let topic = HashFor::<Block>::hash(&[1,2,3]);
@@ -687,7 +669,7 @@ mod tests {
 	#[test]
 	fn topics_are_localized_to_engine_id() {
 		let mut consensus = ConsensusGossip::<Block>::new();
-		consensus.register_validator_internal([0, 0, 0, 0], Arc::new(AllowAll));
+		consensus.validators.insert([0, 0, 0, 0], Arc::new(AllowAll));
 
 		let topic = [1; 32].into();
 		let msg_a = ConsensusMessage { data: vec![1, 2, 3], engine_id: [0, 0, 0, 0] };
