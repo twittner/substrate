@@ -36,7 +36,7 @@ use runtime_primitives::{traits::{Block as BlockT, NumberFor}, ConsensusEngineId
 
 use crate::AlwaysBadChecker;
 use crate::protocol::consensus_gossip::{ConsensusGossip, MessageRecipient as GossipMessageRecipient};
-use crate::protocol::{event::Event, message::Message};
+use crate::protocol::{event::Event, message::{self, Message}};
 use crate::protocol::on_demand::RequestData;
 use crate::protocol::{self, Context, CustomMessageOutcome, ConnectedPeer, PeerInfo};
 use crate::protocol::sync::SyncState;
@@ -113,9 +113,7 @@ impl<B: BlockT + 'static, S: NetworkSpecialization<B>, H: ExHashT> NetworkWorker
 	/// Returns a `NetworkWorker` that implements `Future` and must be regularly polled in order
 	/// for the network processing to advance. From it, you can extract a `NetworkService` using
 	/// `worker.service()`. The `NetworkService` can be shared through the codebase.
-	pub fn new(
-		params: Params<B, S, H>,
-	) -> Result<NetworkWorker<B, S, H>, Error> {
+	pub fn new(params: Params<B, S, H>) -> Result<NetworkWorker<B, S, H>, Error> {
 		let (network_chan, network_port) = mpsc::unbounded();
 		let (protocol_sender, protocol_rx) = mpsc::unbounded();
 
@@ -170,7 +168,7 @@ impl<B: BlockT + 'static, S: NetworkSpecialization<B>, H: ExHashT> NetworkWorker
 		let is_offline = Arc::new(AtomicBool::new(true));
 		let is_major_syncing = Arc::new(AtomicBool::new(false));
 		let peers: Arc<RwLock<HashMap<PeerId, ConnectedPeer<B>>>> = Arc::new(Default::default());
-		let (protocol, peerset_handle) = Protocol::new(
+		let (mut protocol, peerset_handle) = Protocol::new(
 			protocol::ProtocolConfig { roles: params.roles },
 			params.chain,
 			params.on_demand.as_ref().map(|od| od.checker().clone())
@@ -181,6 +179,10 @@ impl<B: BlockT + 'static, S: NetworkSpecialization<B>, H: ExHashT> NetworkWorker
 			params.protocol_id,
 			peerset_config,
 		)?;
+
+		if let Some(v) = params.block_announce_validator {
+			protocol.set_block_announce_validator(v);
+		}
 
 		// Build the swarm.
 		let (mut swarm, bandwidth) = {
@@ -304,10 +306,10 @@ impl<B: BlockT + 'static, S: NetworkSpecialization<B>, H: ExHashT> NetworkServic
 	}
 
 	/// Called when a new block is imported by the client.
-	pub fn on_block_imported(&self, hash: B::Hash, header: B::Header) {
+	pub fn on_block_imported(&self, hash: B::Hash, header: B::Header, data: Vec<u8>) {
 		let _ = self
 			.protocol_sender
-			.unbounded_send(ProtocolMsg::BlockImported(hash, header));
+			.unbounded_send(ProtocolMsg::BlockImported(hash, header, data));
 	}
 
 	/// Called when a new block is finalized by the client.
@@ -326,8 +328,8 @@ impl<B: BlockT + 'static, S: NetworkSpecialization<B>, H: ExHashT> NetworkServic
 	///
 	/// In chain-based consensus, we often need to make sure non-best forks are
 	/// at least temporarily synced.
-	pub fn announce_block(&self, hash: B::Hash) {
-		let _ = self.protocol_sender.unbounded_send(ProtocolMsg::AnnounceBlock(hash));
+	pub fn announce_block(&self, hash: B::Hash, assoc: Vec<u8>) {
+		let _ = self.protocol_sender.unbounded_send(ProtocolMsg::AnnounceBlock(hash, assoc));
 	}
 
 	/// Send a consensus message through the gossip
@@ -549,9 +551,9 @@ pub enum ProtocolMsg<B: BlockT, S: NetworkSpecialization<B>> {
 	/// Inform protocol whether a finality proof was successfully imported.
 	FinalityProofImportResult((B::Hash, NumberFor<B>), Result<(B::Hash, NumberFor<B>), ()>),
 	/// Propagate a block to peers.
-	AnnounceBlock(B::Hash),
+	AnnounceBlock(B::Hash, Vec<u8>),
 	/// A block has been imported (sent by the client).
-	BlockImported(B::Hash, B::Header),
+	BlockImported(B::Hash, B::Header, Vec<u8>),
 	/// A block has been finalized (sent by the client).
 	BlockFinalized(B::Hash, B::Header),
 	/// Execute a closure with the chain-specific network specialization.
@@ -719,8 +721,10 @@ impl<B: BlockT + 'static, S: NetworkSpecialization<B>, H: ExHashT> Future for Ne
 			let mut network_service = self.network_service.lock();
 
 			match msg {
-				ProtocolMsg::BlockImported(hash, header) =>
-					network_service.user_protocol_mut().on_block_imported(hash, &header),
+				ProtocolMsg::BlockImported(hash, header, data) => {
+					let block = message::BlockAnnounce { header, data };
+					network_service.user_protocol_mut().on_block_imported(hash, block)
+				}
 				ProtocolMsg::BlockFinalized(hash, header) =>
 					network_service.user_protocol_mut().on_block_finalized(hash, &header),
 				ProtocolMsg::ExecuteWithSpec(task) => {
@@ -739,8 +743,8 @@ impl<B: BlockT + 'static, S: NetworkSpecialization<B>, H: ExHashT> Future for Ne
 					network_service.user_protocol_mut().blocks_processed(hashes, has_error),
 				ProtocolMsg::RestartSync =>
 					network_service.user_protocol_mut().restart(),
-				ProtocolMsg::AnnounceBlock(hash) =>
-					network_service.user_protocol_mut().announce_block(hash),
+				ProtocolMsg::AnnounceBlock(hash, data) =>
+					network_service.user_protocol_mut().announce_block(hash, data),
 				ProtocolMsg::BlockImportedSync(hash, number) =>
 					network_service.user_protocol_mut().block_imported(&hash, number),
 				ProtocolMsg::ClearJustificationRequests =>

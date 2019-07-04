@@ -35,6 +35,7 @@ use runtime_primitives::traits::{Block, DigestFor};
 use futures::prelude::*;
 pub use inherents::InherentData;
 
+pub mod block_validator;
 pub mod offline_tracker;
 pub mod error;
 pub mod block_import;

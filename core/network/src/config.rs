@@ -23,7 +23,7 @@ use crate::chain::{Client, FinalityProofProvider};
 use crate::on_demand_layer::OnDemand;
 use crate::service::{ExHashT, TransactionPool};
 use bitflags::bitflags;
-use consensus::import_queue::ImportQueue;
+use consensus::{block_validator::BlockAnnounceValidator, import_queue::ImportQueue};
 use parity_codec;
 use runtime_primitives::traits::{Block as BlockT};
 use std::sync::Arc;
@@ -54,6 +54,8 @@ pub struct Params<B: BlockT, S, H: ExHashT> {
 	pub import_queue: Box<dyn ImportQueue<B>>,
 	/// Protocol specialization.
 	pub specialization: S,
+	/// An optional block announcement validator.
+	pub block_announce_validator: Option<Box<dyn BlockAnnounceValidator<B> + Send>>
 }
 
 bitflags! {

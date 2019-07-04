@@ -37,7 +37,11 @@ use log::{debug, trace, warn, info, error};
 use crate::protocol::PeerInfo as ProtocolPeerInfo;
 use libp2p::PeerId;
 use client::{BlockStatus, ClientInfo};
-use consensus::{BlockOrigin, import_queue::{IncomingBlock, SharedFinalityProofRequestBuilder}};
+use consensus::{
+	BlockOrigin,
+	block_validator::{BlockAnnounceValidator, Validation},
+	import_queue::{IncomingBlock, SharedFinalityProofRequestBuilder}
+};
 use client::error::Error as ClientError;
 use blocks::BlockCollection;
 use extra_requests::ExtraRequests;
@@ -172,6 +176,7 @@ pub struct ChainSync<B: BlockT> {
 	/// The best block number that we are currently importing
 	best_importing_number: NumberFor<B>,
 	request_builder: Option<SharedFinalityProofRequestBuilder<B>>,
+	block_announce_validator: Option<Box<dyn BlockAnnounceValidator<B> + Send>>
 }
 
 /// Reported sync state.
@@ -216,7 +221,14 @@ impl<B: BlockT> ChainSync<B> {
 			queue_blocks: Default::default(),
 			best_importing_number: Zero::zero(),
 			request_builder: None,
+			block_announce_validator: None
 		}
+	}
+
+	/// Set a `BlockAnnounceValidator`.
+	pub fn set_block_announce_validator(&mut self, v: Box<dyn BlockAnnounceValidator<B> + Send>) -> &mut Self {
+		self.block_announce_validator = Some(v);
+		self
 	}
 
 	/// Returns the number for the best seen blocks among connected peers, if any
@@ -792,16 +804,33 @@ impl<B: BlockT> ChainSync<B> {
 		protocol: &mut dyn Context<B>,
 		who: PeerId,
 		hash: B::Hash,
-		header: &B::Header,
+		block: &message::BlockAnnounce<B::Header>
 	) -> bool {
-		let number = *header.number();
+		let number = *block.header.number();
 		debug!(target: "sync", "Received block announcement with number {:?}", number);
 		if number.is_zero() {
 			warn!(target: "sync", "Ignored invalid block announcement from {}: {}", who, hash);
 			return false;
 		}
-		let parent_status = block_status(&*protocol.client(), &self.queue_blocks, header.parent_hash().clone()).ok()
+
+		if let Some(val) = self.block_announce_validator.as_mut() {
+			match val.validate(&block.header, &block.data) {
+				Ok(Validation::Failure) => {
+					warn!(target: "sync", "Validation of block announcement {} failed", number);
+					return false
+				}
+				Err(e) => {
+					error!(target: "sync", "Validation of block announcement {} errored: {}", number, e);
+					return false
+				}
+				Ok(_) => {}
+			}
+		}
+
+		let parent_status = block_status(&*protocol.client(), &self.queue_blocks, block.header.parent_hash().clone())
+			.ok()
 			.unwrap_or(BlockStatus::Unknown);
+
 		let known_parent = parent_status != BlockStatus::Unknown;
 		let ancient_parent = parent_status == BlockStatus::InChainPruned;
 
@@ -826,7 +855,7 @@ impl<B: BlockT> ChainSync<B> {
 		}
 		// We assume that the announced block is the latest they have seen, and so our common number
 		// is either one further ahead or it's the one they just announced, if we know about it.
-		if header.parent_hash() == &self.best_queued_hash || known_parent {
+		if block.header.parent_hash() == &self.best_queued_hash || known_parent {
 			peer.common_number = number - One::one();
 		} else if known {
 			peer.common_number = number
@@ -841,14 +870,14 @@ impl<B: BlockT> ChainSync<B> {
 		// stale block case
 		let requires_additional_data = !self.role.is_light();
 		if number <= self.best_queued_number {
-			if !(known_parent || self.is_already_downloading(header.parent_hash())) {
-				if protocol.client().block_status(&BlockId::Number(*header.number()))
+			if !(known_parent || self.is_already_downloading(block.header.parent_hash())) {
+				if protocol.client().block_status(&BlockId::Number(*block.header.number()))
 					.unwrap_or(BlockStatus::Unknown) == BlockStatus::InChainPruned
 				{
 					trace!(
 						target: "sync",
 						"Ignored unknown ancient block announced from {}: {} {:?}",
-						who, hash, header
+						who, hash, block.header
 					);
 					return false;
 				}
@@ -856,7 +885,7 @@ impl<B: BlockT> ChainSync<B> {
 				trace!(
 					target: "sync",
 					"Considering new unknown stale block announced from {}: {} {:?}",
-					who, hash, header
+					who, hash, block.header
 				);
 				let request = self.download_unknown_stale(&who, &hash);
 				match request {
@@ -873,7 +902,7 @@ impl<B: BlockT> ChainSync<B> {
 					trace!(
 						target: "sync",
 						"Ignored ancient stale block announced from {}: {} {:?}",
-						who, hash, header
+						who, hash, block.header
 					);
 					return false;
 				}
@@ -892,11 +921,11 @@ impl<B: BlockT> ChainSync<B> {
 		}
 
 		if ancient_parent {
-			trace!(target: "sync", "Ignored ancient block announced from {}: {} {:?}", who, hash, header);
+			trace!(target: "sync", "Ignored ancient block announced from {}: {} {:?}", who, hash, block.header);
 			return false;
 		}
 
-		trace!(target: "sync", "Considering new block announced from {}: {} {:?}", who, hash, header);
+		trace!(target: "sync", "Considering new block announced from {}: {} {:?}", who, hash, block.header);
 		let (range, request) = match self.select_new_blocks(who.clone()) {
 			Some((range, request)) => (range, request),
 			None => return false,
@@ -904,7 +933,7 @@ impl<B: BlockT> ChainSync<B> {
 		let is_required_data_available =
 			!requires_additional_data &&
 			range.end - range.start == One::one() &&
-			range.start == *header.number();
+			range.start == *block.header.number();
 		if !is_required_data_available {
 			protocol.send_block_request(who, request);
 			return false;

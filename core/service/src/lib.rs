@@ -249,6 +249,7 @@ impl<Components: components::Components> Service<Components> {
 			import_queue,
 			protocol_id,
 			specialization: network_protocol,
+			block_announce_validator: None // TODO
 		};
 
 		let has_bootnodes = !network_params.network_config.boot_nodes.is_empty();
@@ -290,7 +291,7 @@ impl<Components: components::Components> Service<Components> {
 					let number = *notification.header.number();
 
 					if let Some(network) = network.upgrade() {
-						network.on_block_imported(notification.hash, notification.header);
+						network.on_block_imported(notification.hash, notification.header, notification.associated_data);
 					}
 
 					if let (Some(txpool), Some(client)) = (txpool.upgrade(), wclient.upgrade()) {

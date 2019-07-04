@@ -22,7 +22,11 @@ use libp2p::core::swarm::{ConnectedPoint, NetworkBehaviour, NetworkBehaviourActi
 use libp2p::core::{nodes::Substream, muxing::StreamMuxerBox};
 use libp2p::core::protocols_handler::{ProtocolsHandler, IntoProtocolsHandler};
 use primitives::storage::StorageKey;
-use consensus::{import_queue::IncomingBlock, import_queue::Origin, BlockOrigin};
+use consensus::{
+	BlockOrigin,
+	block_validator::BlockAnnounceValidator,
+	import_queue::{IncomingBlock, Origin}
+};
 use runtime_primitives::{generic::BlockId, ConsensusEngineId, Justification};
 use runtime_primitives::traits::{
 	Block as BlockT, Header as HeaderT, NumberFor, One, Zero,
@@ -461,6 +465,12 @@ impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> Protocol<B, S, H> {
 	/// Returns the state of the peerset manager, for debugging purposes.
 	pub fn peerset_debug_info(&mut self) -> serde_json::Value {
 		self.behaviour.peerset_debug_info()
+	}
+
+	/// Set a `BlockAnnounceValidator`.
+	pub fn set_block_announce_validator(&mut self, v: Box<dyn BlockAnnounceValidator<B> + Send>) -> &mut Self {
+		self.sync.set_block_announce_validator(v);
+		self
 	}
 
 	/// Returns the number of peers we're connected to.
@@ -1039,7 +1049,7 @@ impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> Protocol<B, S, H> {
 	///
 	/// In chain-based consensus, we often need to make sure non-best forks are
 	/// at least temporarily synced.
-	pub fn announce_block(&mut self, hash: B::Hash) {
+	pub fn announce_block(&mut self, hash: B::Hash, data: Vec<u8>) {
 		let header = match self.context_data.chain.header(&BlockId::Hash(hash)) {
 			Ok(Some(header)) => header,
 			Ok(None) => {
@@ -1053,7 +1063,10 @@ impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> Protocol<B, S, H> {
 		};
 		let hash = header.hash();
 
-		let message = GenericMessage::BlockAnnounce(message::BlockAnnounce { header: header.clone() });
+		let message = GenericMessage::BlockAnnounce(message::BlockAnnounce {
+			header: header.clone(),
+			data
+		});
 
 		for (who, ref mut peer) in self.context_data.peers.iter_mut() {
 			trace!(target: "sync", "Reannouncing block {:?} to {}", hash, who);
@@ -1083,22 +1096,19 @@ impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> Protocol<B, S, H> {
 		who: PeerId,
 		announce: message::BlockAnnounce<B::Header>
 	) -> CustomMessageOutcome<B>  {
-		let header = announce.header;
-		let hash = header.hash();
-		{
-			if let Some(ref mut peer) = self.context_data.peers.get_mut(&who) {
-				peer.known_blocks.insert(hash.clone());
-			}
+		let hash = announce.header.hash();
+		if let Some(ref mut peer) = self.context_data.peers.get_mut(&who) {
+			peer.known_blocks.insert(hash.clone());
 		}
 		self.on_demand_core.on_block_announce(OnDemandIn {
 			behaviour: &mut self.behaviour,
 			peerset: self.peerset_handle.clone(),
-		}, who.clone(), *header.number());
+		}, who.clone(), *announce.header.number());
 		let try_import = self.sync.on_block_announce(
 			&mut ProtocolContext::new(&mut self.context_data, &mut self.behaviour, &self.peerset_handle),
 			who.clone(),
 			hash,
-			&header,
+			&announce
 		);
 
 		// try_import is only true when we have all data required to import block
@@ -1130,7 +1140,7 @@ impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> Protocol<B, S, H> {
 				blocks: vec![
 					message::generic::BlockData {
 						hash: hash,
-						header: Some(header),
+						header: Some(announce.header),
 						body: None,
 						receipt: None,
 						message_queue: None,
@@ -1147,22 +1157,22 @@ impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> Protocol<B, S, H> {
 
 	/// Call this when a block has been imported in the import queue and we should announce it on
 	/// the network.
-	pub fn on_block_imported(&mut self, hash: B::Hash, header: &B::Header) {
-		self.sync.update_chain_info(header);
+	pub fn on_block_imported(&mut self, hash: B::Hash, block: message::BlockAnnounce<B::Header>) {
+		self.sync.update_chain_info(&block.header);
 		self.specialization.on_block_imported(
 			&mut ProtocolContext::new(&mut self.context_data, &mut self.behaviour, &self.peerset_handle),
 			hash.clone(),
-			header,
+			&block.header
 		);
 
 		// blocks are not announced by light clients
 		if self.config.roles.is_light() {
-			return;
+			return
 		}
 
 		// send out block announcements
 
-		let message = GenericMessage::BlockAnnounce(message::BlockAnnounce { header: header.clone() });
+		let message = GenericMessage::BlockAnnounce(block);
 
 		for (who, ref mut peer) in self.context_data.peers.iter_mut() {
 			if peer.known_blocks.insert(hash.clone()) {

@@ -272,6 +272,8 @@ pub mod generic {
 	pub struct BlockAnnounce<H> {
 		/// New block header.
 		pub header: H,
+		/// Data associated with this block announcement, e.g. candidate message.
+		pub data: Vec<u8>
 	}
 
 	#[derive(Debug, PartialEq, Eq, Clone, Encode, Decode)]

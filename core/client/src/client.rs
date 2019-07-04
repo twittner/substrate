@@ -146,7 +146,9 @@ pub struct ClientImportOperation<Block: BlockT, H: Hasher<Out=Block::Hash>, B: b
 		Option<(
 			StorageCollection,
 			ChildStorageCollection,
-		)>)>,
+		)>,
+		Vec<u8>
+	)>,
 	notify_finalized: Vec<Block::Hash>,
 }
 
@@ -211,6 +213,8 @@ pub struct BlockImportNotification<Block: BlockT> {
 	pub header: Block::Header,
 	/// Is this the new best block.
 	pub is_new_best: bool,
+	/// Any data associated with this block import.
+	pub associated_data: Vec<u8>
 }
 
 /// Summary of a finalized block.
@@ -963,7 +967,7 @@ impl<B, E, Block, RA> Client<B, E, Block, RA> where
 				operation.notify_finalized.push(hash);
 			}
 
-			operation.notify_imported = Some((hash, origin, import_headers.into_post(), is_new_best, storage_changes));
+			operation.notify_imported = Some((hash, origin, import_headers.into_post(), is_new_best, storage_changes, Vec::new()));
 		}
 
 		Ok(ImportResult::imported())
@@ -1138,9 +1142,10 @@ impl<B, E, Block, RA> Client<B, E, Block, RA> where
 				Vec<(Vec<u8>, Option<Vec<u8>>)>,
 				Vec<(Vec<u8>, Vec<(Vec<u8>, Option<Vec<u8>>)>)>,
 				)
-			>),
+			>,
+			Vec<u8>),
 	) -> error::Result<()> {
-		let (hash, origin, header, is_new_best, storage_changes) = notify_import;
+		let (hash, origin, header, is_new_best, storage_changes, associated) = notify_import;
 
 		if let Some(storage_changes) = storage_changes {
 			// TODO [ToDr] How to handle re-orgs? Should we re-emit all storage changes?
@@ -1157,6 +1162,7 @@ impl<B, E, Block, RA> Client<B, E, Block, RA> where
 			origin,
 			header,
 			is_new_best,
+			associated_data: associated
 		};
 
 		self.import_notification_sinks.lock()
