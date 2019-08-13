@@ -40,7 +40,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Default request retry count.
 const RETRY_COUNT: usize = 1;
 /// Reputation change for a peer when a request timed out.
-const TIMEOUT_REPUTATION_CHANGE: i32 = -(1 << 8);
+pub(crate) const TIMEOUT_REPUTATION_CHANGE: i32 = -(1 << 8);
 
 /// Trait used by the `LightDispatch` service to communicate messages back to the network.
 pub trait LightDispatchNetwork<B: BlockT> {
@@ -693,7 +693,7 @@ pub mod tests {
 	use super::{REQUEST_TIMEOUT, LightDispatch, LightDispatchNetwork, RequestData, StorageProof};
 	use sp_test_primitives::{Block, Extrinsic, Header};
 
-	struct DummyFetchChecker { ok: bool }
+	pub(crate) struct DummyFetchChecker { pub(crate) ok: bool }
 
 	impl FetchChecker<Block> for DummyFetchChecker {
 		fn check_header_proof(
@@ -790,7 +790,7 @@ pub mod tests {
 		});
 	}
 
-	fn dummy_header() -> Header {
+	pub(crate) fn dummy_header() -> Header {
 		Header {
 			parent_hash: Default::default(),
 			number: 0,

@@ -205,7 +205,7 @@ impl<B: BlockT + 'static, S: NetworkSpecialization<B>, H: ExHashT> NetworkWorker
 				.unwrap_or(Arc::new(AlwaysBadChecker)),
 			params.specialization,
 			params.transaction_pool,
-			params.finality_proof_provider,
+			params.finality_proof_provider.clone(),
 			params.finality_proof_request_builder,
 			params.protocol_id,
 			peerset_config,
@@ -219,6 +219,14 @@ impl<B: BlockT + 'static, S: NetworkSpecialization<B>, H: ExHashT> NetworkWorker
 				params.network_config.client_version,
 				params.network_config.node_name
 			);
+			let block_requests = {
+				let config = protocol::block_requests::Config::default();
+				protocol::BlockRequests::new(config, params.chain.clone())
+			};
+			let light_client_handler = {
+				let config = protocol::light_client_handler::Config::default();
+				protocol::LightClientHandler::new(config, params.chain, checker, peerset_handle.clone())
+			};
 			let behaviour = futures::executor::block_on(Behaviour::new(
 				protocol,
 				user_agent,
@@ -232,6 +240,8 @@ impl<B: BlockT + 'static, S: NetworkSpecialization<B>, H: ExHashT> NetworkWorker
 					TransportConfig::MemoryOnly => false,
 					TransportConfig::Normal { allow_private_ipv4, .. } => allow_private_ipv4,
 				},
+				block_requests,
+				light_client_handler
 			));
 			let (transport, bandwidth) = {
 				let (config_mem, config_wasm) = match params.network_config.transport {
