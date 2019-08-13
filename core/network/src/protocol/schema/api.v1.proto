@@ -1,0 +1,217 @@
+syntax = "proto3";
+
+package api.v1;
+
+// Block enumeration direction.
+enum Direction {
+	// Enumerate in ascending order (from child to parent).
+	Ascending = 0;
+	// Enumerate in descendfing order (from parent to canonical child).
+	Descending = 1;
+}
+
+// A pair of arbitrary bytes.
+message Pair {
+	// The first element of the pair.
+	bytes fst = 1;
+	// The second element of the pair.
+	bytes snd = 2;
+}
+
+// Status sent on connection.
+message Status {
+	// Protocol version.
+	uint32 version = 1;
+	// Minimum supported version.
+	uint32 min_supported_version = 2;
+	// Supported roles.
+	uint32 roles = 3;
+	// Best block number.
+	bytes best_number = 4;
+	// Best block hash.
+	bytes best_hash = 5;
+	// Genesis block hash.
+	bytes genesis_hash = 6;
+	// Chain-specific status.
+	bytes chain_status = 7;
+}
+
+// Request block data from a peer.
+message BlockRequest {
+	// Unique request id.
+	uint64 id = 1;
+	// Bits of block data to request.
+	uint32 fields = 2;
+	// Start from this block.
+	oneof from_block {
+		// Start with given hash.
+		bytes hash = 3;
+		// Start with given block number.
+		bytes number = 4;
+	}
+	// End at this block. An implementation defined maximum is used when unspecified.
+	bytes to_block = 5;
+	// Sequence direction.
+	Direction direction = 6;
+	// Maximum number of blocks to return. An implementation defined maximum is used when unspecified.
+	uint32 max_blocks = 7;
+}
+
+// Response to `BlockRequest`
+message BlockResponse {
+	// Id of a request this response was made for.
+	uint64 id = 1;
+	// Block data for the requested sequence.
+	repeated BlockData blocks = 2;
+}
+
+// Block data sent in the response.
+message BlockData {
+	// Block header hash.
+	bytes hash = 1;
+	// Block header if requested.
+	bytes header = 2;
+	// Block body if requested.
+	repeated bytes body = 3;
+	// Block receipt if requested.
+	bytes receipt = 4;
+	// Block message queue if requested.
+	bytes message_queue = 5;
+	// Justification if requested.
+	bytes justification = 6;
+}
+
+// Announce a new complete relay chain block on the network.
+message BlockAnnounce {
+	/// New block header.
+	bytes header = 1;
+}
+
+// Remote call request.
+message RemoteCallRequest {
+	// Unique request id.
+	uint64 id = 1;
+	// Block at which to perform call.
+	bytes block = 2;
+	// Method name.
+	string method = 3;
+	// Call data.
+	bytes data = 4;
+}
+
+// Remote call response.
+message RemoteCallResponse {
+	// Id of a request this response was made for.
+	uint64 id = 1;
+	// Execution proof.
+	bytes proof = 2;
+}
+
+// Remote storage read request.
+message RemoteReadRequest {
+	// Unique request id.
+	uint64 id = 1;
+	// Block at which to perform call.
+	bytes block = 2;
+	// Storage key.
+	bytes key = 3;
+}
+
+// Remote storage read child request.
+message RemoteReadChildRequest {
+	// Unique request id.
+	uint64 id = 1;
+	// Block at which to perform call.
+	bytes block = 2;
+	// Child Storage key.
+	bytes storage_key = 3;
+	// Storage key.
+	bytes key = 4;
+}
+
+// Remote header request.
+message RemoteHeaderRequest {
+	// Unique request id.
+	uint64 id = 1;
+	// Block number to request header for.
+	bytes block =2;
+}
+
+// Remote header response.
+message RemoteHeaderResponse {
+	// Id of a request this response was made for.
+	uint64 id = 1;
+	// Header. None if proof generation has failed (e.g. header is unknown).
+	bytes header = 2;
+	// Header proof.
+	repeated bytes proof = 3;
+}
+
+/// Remote changes request.
+message RemoteChangesRequest {
+	/// Unique request id.
+	uint64 id = 1;
+	/// Hash of the first block of the range (including first) where changes are requested.
+	bytes first = 2;
+	/// Hash of the last block of the range (including last) where changes are requested.
+	bytes last = 3;
+	/// Hash of the first block for which the requester has the changes trie root. All other
+	/// affected roots must be proved.
+	bytes min = 4;
+	/// Hash of the last block that we can use when querying changes.
+	bytes max = 5;
+	/// Storage key which changes are requested.
+	bytes key = 6;
+}
+
+// Remote changes response.
+message RemoteChangesResponse {
+	// Id of a request this response was made for.
+	uint64 id = 1;
+	// Proof has been generated using block with this number as a max block. Should be
+	// less than or equal to the RemoteChangesRequest::max block number.
+	bytes max = 2;
+	// Changes proof.
+	repeated bytes proof = 3;
+	// Changes tries roots missing on the requester' node.
+	repeated Pair roots = 4;
+	// Missing changes tries roots proof.
+	repeated bytes roots_proof = 5;
+}
+
+// Finality proof request.
+message FinalityProofRequest {
+	/// Unique request id.
+	uint64 id = 1;
+	/// Hash of the block to request proof for.
+	bytes block = 2;
+	/// Additional data blob (that both requester and provider understood) required for proving finality.
+	bytes request = 3;
+}
+
+// Finality proof response.
+message FinalityProofResponse {
+	/// Id of a request this response was made for.
+	uint64 id = 1;
+	/// Hash of the block (the same as in the FinalityProofRequest).
+	bytes block = 2;
+	/// Finality proof (if available).
+	bytes proof = 3;
+}
+
+// Remote read response.
+message RemoteReadResponse {
+	// Id of a request this response was made for.
+	uint64 id = 1;
+	// Read proof.
+	bytes proof = 2;
+}
+
+// Consensus is mostly opaque to us
+message ConsensusMessage {
+	/// Identifies consensus engine.
+	bytes engine_id = 1;
+	/// Message payload.
+	bytes data = 2;
+}
+

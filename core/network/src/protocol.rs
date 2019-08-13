@@ -49,7 +49,15 @@ use client::light::fetcher::{FetchChecker, ChangesProof};
 use crate::error;
 use util::LruHashSet;
 
+// Include sources generated from protobuf definitions.
+mod api {
+	pub mod v1 {
+		include!(concat!(env!("OUT_DIR"), "/api.v1.rs"));
+	}
+}
+
 mod util;
+pub mod block_requests;
 pub mod consensus_gossip;
 pub mod message;
 pub mod event;
