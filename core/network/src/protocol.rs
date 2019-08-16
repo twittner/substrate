@@ -64,6 +64,7 @@ pub mod block_requests;
 pub mod consensus_gossip;
 pub mod message;
 pub mod event;
+pub mod light_client_handler;
 pub mod light_dispatch;
 pub mod specialization;
 pub mod sync;

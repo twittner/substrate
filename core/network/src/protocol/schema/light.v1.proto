@@ -12,6 +12,30 @@ message Pair {
 	bytes snd = 2;
 }
 
+// Enumerate all possible light client request messages.
+message Request {
+	oneof request {
+		RemoteCallRequest remote_call_request = 1;
+		RemoteReadRequest remote_read_request = 2;
+		RemoteHeaderRequest remote_header_request = 3;
+		RemoteReadChildRequest remote_read_child_request = 4;
+		RemoteChangesRequest remote_changes_request = 5;
+		FinalityProofRequest finality_proof_request = 6;
+	}
+}
+
+// Enumerate all possible light client response messages.
+message Response {
+	oneof response {
+		RemoteCallResponse remote_call_response = 1;
+		RemoteReadResponse remote_read_response = 2;
+		RemoteHeaderResponse remote_header_response = 3;
+		RemoteReadChildRequest remote_read_child_response = 4;
+		RemoteChangesResponse remote_changes_response = 5;
+		FinalityProofResponse finality_proof_response = 6;
+	}
+}
+
 // Remote call request.
 message RemoteCallRequest {
 	// Unique request id.
