@@ -19,7 +19,7 @@ use crate::{
 	protocol::event::DhtEvent
 };
 use crate::{ExHashT, specialization::NetworkSpecialization};
-use crate::protocol::{CustomMessageOutcome, Protocol};
+use crate::protocol::{self, CustomMessageOutcome, Protocol};
 use futures::prelude::*;
 use libp2p::NetworkBehaviour;
 use libp2p::core::{Multiaddr, PeerId, PublicKey};
@@ -42,6 +42,8 @@ pub struct Behaviour<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> {
 	debug_info: debug_info::DebugInfoBehaviour<Substream<StreamMuxerBox>>,
 	/// Discovers nodes of the network.
 	discovery: DiscoveryBehaviour<Substream<StreamMuxerBox>>,
+	/// Block request handling.
+	block_requests: protocol::BlockRequests<Substream<StreamMuxerBox>, B>,
 
 	/// Queue of events to produce for the outside.
 	#[behaviour(ignore)]
@@ -62,11 +64,13 @@ impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> Behaviour<B, S, H> {
 		local_public_key: PublicKey,
 		known_addresses: Vec<(PeerId, Multiaddr)>,
 		enable_mdns: bool,
+		block_requests: protocol::BlockRequests<Substream<StreamMuxerBox>, B>
 	) -> Self {
 		Behaviour {
 			substrate,
 			debug_info: debug_info::DebugInfoBehaviour::new(user_agent, local_public_key.clone()),
 			discovery: DiscoveryBehaviour::new(local_public_key, known_addresses, enable_mdns),
+			block_requests,
 			events: Vec::new(),
 		}
 	}

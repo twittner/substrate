@@ -1,0 +1,134 @@
+// Schema definition for light client messages.
+
+syntax = "proto3";
+
+package api.v1.light;
+
+// A pair of arbitrary bytes.
+message Pair {
+	// The first element of the pair.
+	bytes fst = 1;
+	// The second element of the pair.
+	bytes snd = 2;
+}
+
+// Remote call request.
+message RemoteCallRequest {
+	// Unique request id.
+	uint64 id = 1;
+	// Block at which to perform call.
+	bytes block = 2;
+	// Method name.
+	string method = 3;
+	// Call data.
+	bytes data = 4;
+}
+
+// Remote call response.
+message RemoteCallResponse {
+	// Id of a request this response was made for.
+	uint64 id = 1;
+	// Execution proof.
+	bytes proof = 2;
+}
+
+// Remote storage read request.
+message RemoteReadRequest {
+	// Unique request id.
+	uint64 id = 1;
+	// Block at which to perform call.
+	bytes block = 2;
+	// Storage key.
+	bytes key = 3;
+}
+
+// Remote storage read child request.
+message RemoteReadChildRequest {
+	// Unique request id.
+	uint64 id = 1;
+	// Block at which to perform call.
+	bytes block = 2;
+	// Child Storage key.
+	bytes storage_key = 3;
+	// Storage key.
+	bytes key = 4;
+}
+
+// Remote header request.
+message RemoteHeaderRequest {
+	// Unique request id.
+	uint64 id = 1;
+	// Block number to request header for.
+	bytes block =2;
+}
+
+// Remote header response.
+message RemoteHeaderResponse {
+	// Id of a request this response was made for.
+	uint64 id = 1;
+	// Header. None if proof generation has failed (e.g. header is unknown).
+	bytes header = 2;
+	// Header proof.
+	repeated bytes proof = 3;
+}
+
+/// Remote changes request.
+message RemoteChangesRequest {
+	/// Unique request id.
+	uint64 id = 1;
+	/// Hash of the first block of the range (including first) where changes are requested.
+	bytes first = 2;
+	/// Hash of the last block of the range (including last) where changes are requested.
+	bytes last = 3;
+	/// Hash of the first block for which the requester has the changes trie root. All other
+	/// affected roots must be proved.
+	bytes min = 4;
+	/// Hash of the last block that we can use when querying changes.
+	bytes max = 5;
+	/// Storage key which changes are requested.
+	bytes key = 6;
+}
+
+// Remote changes response.
+message RemoteChangesResponse {
+	// Id of a request this response was made for.
+	uint64 id = 1;
+	// Proof has been generated using block with this number as a max block. Should be
+	// less than or equal to the RemoteChangesRequest::max block number.
+	bytes max = 2;
+	// Changes proof.
+	repeated bytes proof = 3;
+	// Changes tries roots missing on the requester' node.
+	repeated Pair roots = 4;
+	// Missing changes tries roots proof.
+	repeated bytes roots_proof = 5;
+}
+
+// Finality proof request.
+message FinalityProofRequest {
+	/// Unique request id.
+	uint64 id = 1;
+	/// Hash of the block to request proof for.
+	bytes block = 2;
+	/// Additional data blob (that both requester and provider understood) required for proving finality.
+	bytes request = 3;
+}
+
+// Finality proof response.
+message FinalityProofResponse {
+	/// Id of a request this response was made for.
+	uint64 id = 1;
+	/// Hash of the block (the same as in the FinalityProofRequest).
+	bytes block = 2;
+	/// Finality proof (if available).
+	bytes proof = 3;
+}
+
+// Remote read response.
+message RemoteReadResponse {
+	// Id of a request this response was made for.
+	uint64 id = 1;
+	// Read proof.
+	bytes proof = 2;
+}
+

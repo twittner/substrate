@@ -113,9 +113,7 @@ impl<B: BlockT + 'static, S: NetworkSpecialization<B>, H: ExHashT> NetworkWorker
 	/// Returns a `NetworkWorker` that implements `Future` and must be regularly polled in order
 	/// for the network processing to advance. From it, you can extract a `NetworkService` using
 	/// `worker.service()`. The `NetworkService` can be shared through the codebase.
-	pub fn new(
-		params: Params<B, S, H>,
-	) -> Result<NetworkWorker<B, S, H>, Error> {
+	pub fn new(params: Params<B, S, H>) -> Result<NetworkWorker<B, S, H>, Error> {
 		let (to_worker, from_worker) = mpsc::unbounded();
 
 		if let Some(ref path) = params.network_config.net_config_path {
@@ -169,7 +167,7 @@ impl<B: BlockT + 'static, S: NetworkSpecialization<B>, H: ExHashT> NetworkWorker
 		let is_major_syncing = Arc::new(AtomicBool::new(false));
 		let (protocol, peerset_handle) = Protocol::new(
 			protocol::ProtocolConfig { roles: params.roles },
-			params.chain,
+			params.chain.clone(),
 			params.on_demand.as_ref().map(|od| od.checker().clone())
 				.unwrap_or(Arc::new(AlwaysBadChecker)),
 			params.specialization,
@@ -195,7 +193,8 @@ impl<B: BlockT + 'static, S: NetworkSpecialization<B>, H: ExHashT> NetworkWorker
 				match params.network_config.transport {
 					TransportConfig::MemoryOnly => false,
 					TransportConfig::Normal { enable_mdns, .. } => enable_mdns,
-				}
+				},
+				protocol::BlockRequests::new(protocol::block_requests::Config::default(), params.chain)
 			);
 			let (transport, bandwidth) = {
 				let (config_mem, config_wasm) = match params.network_config.transport {

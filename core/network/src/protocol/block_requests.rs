@@ -1,3 +1,9 @@
+//! `NetworkBehaviour` implementation which handles incoming block requests.
+//!
+//! Every request is coming in on a separate connection substream which gets
+//! closed after we have sent the response back. Incoming requests are encoded
+//! as protocol buffers (cf. `api.v1.proto`).
+
 use codec::{Encode, Decode};
 use crate::{
 	chain::Client,
@@ -20,21 +26,23 @@ use sr_primitives::{generic::BlockId, traits::{Block, Header, One, Zero}};
 use std::{
 	cmp::min,
 	collections::VecDeque,
-	error::Error,
 	io,
 	iter,
-	marker::PhantomData,
 	sync::Arc,
 	time::Duration
 };
 use tokio_io::{AsyncRead, AsyncWrite};
 use void::{Void, unreachable};
 
-/// `BlockRequests` configuration options.
+// Type alias for convenience.
+pub type Error = Box<dyn std::error::Error + 'static>;
+
+/// Configuration options for `BlockRequests`.
 #[derive(Debug, Clone)]
 pub struct Config {
 	max_block_data_response: u32,
 	max_request_len: usize,
+	inactivity_timeout: Duration
 }
 
 impl Default for Config {
@@ -47,27 +55,39 @@ impl Config {
 	pub fn new() -> Self {
 		Config {
 			max_block_data_response: 128,
-			max_request_len: 1024 * 1024
+			max_request_len: 1024 * 1024,
+			inactivity_timeout: Duration::from_secs(5)
 		}
 	}
 
+	/// Limit the max. number of block data in a response.
 	pub fn set_max_block_data_response(&mut self, v: u32) -> &mut Self {
 		self.max_block_data_response = v;
 		self
 	}
 
+	/// Limit the max. length of incoming block request bytes.
 	pub fn set_max_request_len(&mut self, v: usize) -> &mut Self {
 		self.max_request_len = v;
 		self
 	}
+
+	/// Limit the max. duration the substream may remain inactive before closing it.
+	pub fn set_inactivity_timeout(&mut self, v: Duration) -> &mut Self {
+		self.inactivity_timeout = v;
+		self
+	}
 }
 
-// TODO: #[derive(Debug)]
+/// The block request handling behaviour.
+// TODO (after https://github.com/libp2p/rust-libp2p/pull/1226): #[derive(Debug)]
 pub struct BlockRequests<T, B: Block> {
+	/// This behaviour's configuration.
 	config: Config,
+	/// Blockchain client.
 	chain: Arc<dyn Client<B>>,
-	outgoing: VecDeque<WriteOne<Negotiated<T>, Vec<u8>>>,
-	_mark: PhantomData<T>
+	/// Pending futures, sending back the block request response.
+	outgoing: VecDeque<WriteOne<Negotiated<T>, Vec<u8>>>
 }
 
 impl<T, B> BlockRequests<T, B>
@@ -79,8 +99,7 @@ where
 		BlockRequests {
 			config: cfg,
 			chain,
-			outgoing: VecDeque::new(),
-			_mark: PhantomData
+			outgoing: VecDeque::new()
 		}
 	}
 
@@ -89,7 +108,7 @@ where
 		( &mut self
 		, peer: &PeerId
 		, request: &api::v1::BlockRequest
-		) -> Result<api::v1::BlockResponse, Box<dyn Error + 'static>>
+		) -> Result<api::v1::BlockResponse, Error>
 	{
 		trace!("block request {} from peer {}: from block {:?} to block {:?}, max blocks {:?}",
 			request.id,
@@ -196,14 +215,14 @@ where
 	T: AsyncRead + AsyncWrite,
 	B: Block
 {
-	type ProtocolsHandler = OneShotHandler<T, Protocol, DeniedUpgrade, Event<T>>;
-	type OutEvent = ();
+	type ProtocolsHandler = OneShotHandler<T, Protocol, DeniedUpgrade, Request<T>>;
+	type OutEvent = Void;
 
 	fn new_handler(&mut self) -> Self::ProtocolsHandler {
 		let p = Protocol {
 			max_request_len: self.config.max_request_len
 		};
-		OneShotHandler::new(SubstreamProtocol::new(p), Duration::from_secs(5))
+		OneShotHandler::new(SubstreamProtocol::new(p), self.config.inactivity_timeout)
 	}
 
 	fn addresses_of_peer(&mut self, _: &PeerId) -> Vec<Multiaddr> {
@@ -216,24 +235,22 @@ where
 	fn inject_disconnected(&mut self, _peer: &PeerId, _info: ConnectedPoint) {
 	}
 
-	fn inject_node_event(&mut self, peer: PeerId, event: Event<T>) {
-		match event {
-			Event::BlockRequest(req, stream) => match self.on_block_request(&peer, &req) {
-				Ok(res) => {
-					trace!("enqueueing block response {} for peer {} with {} blocks", res.id, peer, res.blocks.len());
-					let mut data = Vec::with_capacity(res.encoded_len());
-					if let Err(e) = res.encode(&mut data) {
-						debug!("error encoding block response {} for peer {}: {}", res.id, peer, e)
-					} else {
-						self.outgoing.push_back(write_one(stream, data))
-					}
+	fn inject_node_event(&mut self, peer: PeerId, Request(request, stream): Request<T>) {
+		match self.on_block_request(&peer, &request) {
+			Ok(res) => {
+				trace!("enqueueing block response {} for peer {} with {} blocks", res.id, peer, res.blocks.len());
+				let mut data = Vec::with_capacity(res.encoded_len());
+				if let Err(e) = res.encode(&mut data) {
+					debug!("error encoding block response {} for peer {}: {}", res.id, peer, e)
+				} else {
+					self.outgoing.push_back(write_one(stream, data))
 				}
-				Err(e) => debug!("error handling block request {} from peer {}: {}", req.id, peer, e)
 			}
+			Err(e) => debug!("error handling block request {} from peer {}: {}", request.id, peer, e)
 		}
 	}
 
-	fn poll(&mut self, _: &mut impl PollParameters) -> Async<NetworkBehaviourAction<DeniedUpgrade, ()>> {
+	fn poll(&mut self, _: &mut impl PollParameters) -> Async<NetworkBehaviourAction<DeniedUpgrade, Void>> {
 		let mut remaining = self.outgoing.len();
 		while let Some(mut write_future) = self.outgoing.pop_front() {
 			remaining -= 1;
@@ -246,21 +263,18 @@ where
 				break
 			}
 		}
-
-		if self.outgoing.is_empty() {
-			Async::Ready(NetworkBehaviourAction::GenerateEvent(()))
-		} else {
-			Async::NotReady
-		}
+		Async::NotReady
 	}
 }
 
-// TODO: #[derive(Debug)]
-pub enum Event<T> {
-	BlockRequest(api::v1::BlockRequest, Negotiated<T>)
-}
+/// The incoming block request.
+///
+/// Holds the protobuf value and the connection substream which made the
+/// request and over which to send the response.
+// TODO (after https://github.com/libp2p/rust-libp2p/pull/1226): #[derive(Debug)]
+pub struct Request<T>(api::v1::BlockRequest, Negotiated<T>);
 
-impl<T> From<Void> for Event<T> {
+impl<T> From<Void> for Request<T> {
 	fn from(v: Void) -> Self {
 		unreachable(v)
 	}
@@ -268,12 +282,13 @@ impl<T> From<Void> for Event<T> {
 
 /// Substream upgrade protocol.
 ///
-/// We attempt to parse an incoming protobuf encoded request (cf. `Event`)
+/// We attempt to parse an incoming protobuf encoded request (cf. `Request`)
 /// which will be handled by the `BlockRequests` behaviour, i.e. the request
 /// will become visible via `inject_node_event` which then dispatches to the
 /// relevant callback to process the message and prepare a response.
 #[derive(Debug, Clone)]
 pub struct Protocol {
+	/// The max. request length in bytes.
 	max_request_len: usize
 }
 
@@ -282,19 +297,19 @@ impl UpgradeInfo for Protocol {
     type InfoIter = iter::Once<Self::Info>;
 
     fn protocol_info(&self) -> Self::InfoIter {
-        iter::once(b"/substrate/1.0.0") // TODO
+        iter::once(b"/polkadot/sync/1")
     }
 }
 
 impl<T: AsyncRead> InboundUpgrade<T> for Protocol {
-    type Output = Event<T>;
+    type Output = Request<T>;
     type Error = ReadOneError;
     type Future = ReadRespond<Negotiated<T>, (), fn(Negotiated<T>, Vec<u8>, ()) -> Result<Self::Output, Self::Error>>;
 
     fn upgrade_inbound(self, s: Negotiated<T>, _: Self::Info) -> Self::Future {
 		read_respond(s, self.max_request_len, (), |s, buf, ()| {
 			api::v1::BlockRequest::decode(buf)
-				.map(move |r| Event::BlockRequest(r, s))
+				.map(move |r| Request(r, s))
 				.map_err(|decode_error| {
 					ReadOneError::Io(std::io::Error::new(std::io::ErrorKind::Other, decode_error))
 				})
