@@ -4,6 +4,15 @@
 //! closed after we have sent the response back. Incoming requests are encoded
 //! as protocol buffers (cf. `api.v1.proto`).
 
+// Overview: We first define the various configuration options the
+// `BlockRequests` struct supports. Then we define the struct itself with its
+// callback methods (e.g. `on_block_request`) before defining the implementation
+// of `NetworkBehaviour`. Finally we specify `Protocol`, an `InboundUpgrade`
+// for connection streams which parses incoming protobuf messages and wraps
+// them in a `Request` object together with the actual connection substream.
+// This `Protocol` is used by the `NetworkBehaviour`'s protocol handler
+// (`OneShotHandler`).
+
 use codec::{Encode, Decode};
 use crate::{
 	chain::Client,

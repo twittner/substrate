@@ -14,32 +14,34 @@ message Pair {
 
 // Enumerate all possible light client request messages.
 message Request {
+	// Unique request id.
+	uint64 id = 1;
 	oneof request {
-		RemoteCallRequest remote_call_request = 1;
-		RemoteReadRequest remote_read_request = 2;
-		RemoteHeaderRequest remote_header_request = 3;
-		RemoteReadChildRequest remote_read_child_request = 4;
-		RemoteChangesRequest remote_changes_request = 5;
-		FinalityProofRequest finality_proof_request = 6;
+		RemoteCallRequest remote_call_request = 2;
+		RemoteReadRequest remote_read_request = 3;
+		RemoteHeaderRequest remote_header_request = 4;
+		RemoteReadChildRequest remote_read_child_request = 5;
+		RemoteChangesRequest remote_changes_request = 6;
+		FinalityProofRequest finality_proof_request = 7;
 	}
 }
 
 // Enumerate all possible light client response messages.
 message Response {
+	/// Id of a request this response was made for.
+	uint64 id = 1;
 	oneof response {
-		RemoteCallResponse remote_call_response = 1;
-		RemoteReadResponse remote_read_response = 2;
-		RemoteHeaderResponse remote_header_response = 3;
-		RemoteReadChildRequest remote_read_child_response = 4;
-		RemoteChangesResponse remote_changes_response = 5;
-		FinalityProofResponse finality_proof_response = 6;
+		RemoteCallResponse remote_call_response = 2;
+		RemoteReadResponse remote_read_response = 3;
+		RemoteHeaderResponse remote_header_response = 4;
+		RemoteReadChildRequest remote_read_child_response = 5;
+		RemoteChangesResponse remote_changes_response = 6;
+		FinalityProofResponse finality_proof_response = 7;
 	}
 }
 
 // Remote call request.
 message RemoteCallRequest {
-	// Unique request id.
-	uint64 id = 1;
 	// Block at which to perform call.
 	bytes block = 2;
 	// Method name.
@@ -50,26 +52,26 @@ message RemoteCallRequest {
 
 // Remote call response.
 message RemoteCallResponse {
-	// Id of a request this response was made for.
-	uint64 id = 1;
 	// Execution proof.
-	bytes proof = 2;
+	repeated bytes proof = 2;
 }
 
 // Remote storage read request.
 message RemoteReadRequest {
-	// Unique request id.
-	uint64 id = 1;
 	// Block at which to perform call.
 	bytes block = 2;
 	// Storage key.
 	bytes key = 3;
 }
 
+// Remote read response.
+message RemoteReadResponse {
+	// Read proof.
+	repeated bytes proof = 2;
+}
+
 // Remote storage read child request.
 message RemoteReadChildRequest {
-	// Unique request id.
-	uint64 id = 1;
 	// Block at which to perform call.
 	bytes block = 2;
 	// Child Storage key.
@@ -80,16 +82,12 @@ message RemoteReadChildRequest {
 
 // Remote header request.
 message RemoteHeaderRequest {
-	// Unique request id.
-	uint64 id = 1;
 	// Block number to request header for.
 	bytes block =2;
 }
 
 // Remote header response.
 message RemoteHeaderResponse {
-	// Id of a request this response was made for.
-	uint64 id = 1;
 	// Header. None if proof generation has failed (e.g. header is unknown).
 	bytes header = 2;
 	// Header proof.
@@ -98,8 +96,6 @@ message RemoteHeaderResponse {
 
 /// Remote changes request.
 message RemoteChangesRequest {
-	/// Unique request id.
-	uint64 id = 1;
 	/// Hash of the first block of the range (including first) where changes are requested.
 	bytes first = 2;
 	/// Hash of the last block of the range (including last) where changes are requested.
@@ -115,8 +111,6 @@ message RemoteChangesRequest {
 
 // Remote changes response.
 message RemoteChangesResponse {
-	// Id of a request this response was made for.
-	uint64 id = 1;
 	// Proof has been generated using block with this number as a max block. Should be
 	// less than or equal to the RemoteChangesRequest::max block number.
 	bytes max = 2;
@@ -130,8 +124,6 @@ message RemoteChangesResponse {
 
 // Finality proof request.
 message FinalityProofRequest {
-	/// Unique request id.
-	uint64 id = 1;
 	/// Hash of the block to request proof for.
 	bytes block = 2;
 	/// Additional data blob (that both requester and provider understood) required for proving finality.
@@ -140,19 +132,9 @@ message FinalityProofRequest {
 
 // Finality proof response.
 message FinalityProofResponse {
-	/// Id of a request this response was made for.
-	uint64 id = 1;
 	/// Hash of the block (the same as in the FinalityProofRequest).
 	bytes block = 2;
 	/// Finality proof (if available).
 	bytes proof = 3;
-}
-
-// Remote read response.
-message RemoteReadResponse {
-	// Id of a request this response was made for.
-	uint64 id = 1;
-	// Read proof.
-	bytes proof = 2;
 }
 

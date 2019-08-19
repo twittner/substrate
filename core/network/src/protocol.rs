@@ -70,6 +70,7 @@ pub mod specialization;
 pub mod sync;
 
 pub use block_requests::BlockRequests;
+pub use light_client_handler::LightClientHandler;
 
 const REQUEST_TIMEOUT_SEC: u64 = 40;
 /// Interval at which we perform time based maintenance

@@ -1,7 +1,24 @@
+//! `NetworkBehaviour` implementation which handles incoming light client
+//! requests.
+//!
+//! Every request is coming in on a separate connection substream which gets
+//! closed after we have sent the response back. Incoming requests are encoded
+//! as protocol buffers (cf. `light.v1.proto`).
+
+// Overview: We first define the various configuration options the
+// `LightClientHandler` struct supports. Then we define the struct itself with
+// its callback methods (e.g. `on_remote_call_request`) before defining the
+// implementation of the `NetworkBehaviour` trait for `LightClientHandler`.
+// Finally we specify `Protocol`, an `InboundUpgrade` for connection streams
+// which parses incoming protobuf messages and wraps them in a `Request` object
+// together with the actual connection substream. This `Protocol` is used by
+// the `NetworkBehaviour`'s protocol handler (`OneShotHandler`).
+
 use codec::{Encode, Decode};
+use client::light::fetcher::ChangesProof;
 use crate::{
-	chain::Client,
-	protocol::{api, message::BlockAttributes}
+	chain::{Client, FinalityProofProvider},
+	protocol::api
 };
 use futures::prelude::*;
 use libp2p::{
@@ -15,11 +32,12 @@ use libp2p::{
 	swarm::{NetworkBehaviour, NetworkBehaviourAction, OneShotHandler, PollParameters, SubstreamProtocol}
 };
 use log::{debug, trace};
+use primitives::storage::StorageKey;
 use prost::Message;
-use sr_primitives::{generic::BlockId, traits::{Block, Header, One, Zero}};
+use rustc_hex::ToHex;
+use sr_primitives::traits::{Block, Zero};
 use std::{
-	cmp::min,
-	collections::VecDeque,
+	collections::{BTreeMap, VecDeque},
 	io,
 	iter,
 	sync::Arc,
@@ -72,6 +90,8 @@ pub struct LightClientHandler<T, B: Block> {
 	config: Config,
 	/// Blockchain client.
 	chain: Arc<dyn Client<B>>,
+	/// When asked for a proof of finality, we use this struct to build one.
+	finality_proof_provider: Option<Arc<dyn FinalityProofProvider<B>>>,
 	/// Pending futures, sending back the responses.
 	outgoing: VecDeque<WriteOne<Negotiated<T>, Vec<u8>>>
 }
@@ -85,8 +105,213 @@ where
 		LightClientHandler {
 			config: cfg,
 			chain,
+			finality_proof_provider: None,
 			outgoing: VecDeque::new()
 		}
+	}
+
+	pub fn set_finality_proof_provider(&mut self, p: Option<Arc<dyn FinalityProofProvider<B>>>) {
+		self.finality_proof_provider = p
+	}
+
+	fn on_remote_call_request
+		( &mut self
+		, peer: &PeerId
+		, request_id: u64
+		, request: &api::v1::light::RemoteCallRequest
+		) -> Result<api::v1::light::Response, Error>
+	{
+		trace!(target: "sync", "Remote call request {} from {} ({} at {:?})",
+			request_id,
+			peer,
+			request.method,
+			request.block
+		);
+
+		let block = Decode::decode(&mut request.block.as_ref())?;
+
+		let proof = match self.chain.execution_proof(&block, &request.method, &request.data) {
+			Ok((_, proof)) => proof,
+			Err(e) => {
+				trace!(target: "sync", "Remote call request {} from {} ({} at {:?}) failed with: {}",
+					request_id,
+					peer,
+					request.method,
+					request.block,
+					e);
+				Vec::new()
+			}
+		};
+
+		let response = {
+			let r = api::v1::light::RemoteCallResponse { proof };
+			api::v1::light::response::Response::RemoteCallResponse(r)
+		};
+
+		Ok(api::v1::light::Response { id: request_id, response: Some(response) })
+	}
+
+	fn on_remote_read_request
+		( &mut self
+		, peer: &PeerId
+		, request_id: u64
+		, request: &api::v1::light::RemoteReadRequest
+		) -> Result<api::v1::light::Response, Error>
+	{
+		trace!(target: "sync", "Remote read request {} from {} ({} at {:?})",
+			request_id,
+			peer,
+			request.key.to_hex::<String>(),
+			request.block);
+
+		let block = Decode::decode(&mut request.block.as_ref())?;
+
+		let proof = match self.chain.read_proof(&block, &request.key) {
+			Ok(proof) => proof,
+			Err(error) => {
+				trace!(target: "sync", "Remote read request {} from {} ({} at {:?}) failed with: {}",
+					request_id,
+					peer,
+					request.key.to_hex::<String>(),
+					request.block,
+					error);
+				Vec::new()
+			}
+		};
+
+		let response = {
+			let r = api::v1::light::RemoteReadResponse { proof };
+			api::v1::light::response::Response::RemoteReadResponse(r)
+		};
+
+		Ok(api::v1::light::Response { id: request_id, response: Some(response) })
+	}
+
+	fn on_remote_header_request
+		( &mut self
+		, peer: &PeerId
+		, request_id: u64
+		, request: &api::v1::light::RemoteHeaderRequest
+		) -> Result<api::v1::light::Response, Error>
+	{
+		trace!(target: "sync", "Remote header proof request {} from {} ({:?})",
+			request_id,
+			peer,
+			request.block);
+
+		let block = Decode::decode(&mut request.block.as_ref())?;
+
+		let (header, proof) = match self.chain.header_proof(block) {
+			Ok((header, proof)) => (header.encode(), proof),
+			Err(error) => {
+				trace!(target: "sync", "Remote header proof request {} from {} ({:?}) failed with: {}",
+					request_id,
+					peer,
+					request.block,
+					error);
+				(Default::default(), Vec::new())
+			}
+		};
+
+		let response = {
+			let r = api::v1::light::RemoteHeaderResponse { header, proof };
+			api::v1::light::response::Response::RemoteHeaderResponse(r)
+		};
+
+		Ok(api::v1::light::Response { id: request_id, response: Some(response) })
+	}
+
+	fn on_remote_changes_request
+		( &mut self
+		, peer: &PeerId
+		, request_id: u64
+		, request: &api::v1::light::RemoteChangesRequest
+		) -> Result<api::v1::light::Response, Error>
+	{
+		trace!(target: "sync", "Remote changes proof request {} from {} for key {} ({:?}..{:?})",
+			request_id,
+			peer,
+			request.key.to_hex::<String>(),
+			request.first,
+			request.last
+		);
+
+		let first = Decode::decode(&mut request.first.as_ref())?;
+		let last = Decode::decode(&mut request.last.as_ref())?;
+		let min = Decode::decode(&mut request.min.as_ref())?;
+		let max = Decode::decode(&mut request.max.as_ref())?;
+		let key = StorageKey(request.key.clone());
+
+		let proof = match self.chain.key_changes_proof(first, last, min, max, &key) {
+			Ok(proof) => proof,
+			Err(error) => {
+				trace!(target: "sync",
+					"Remote changes proof request {} from {} for key {} ({:?}..{:?}) failed with: {}",
+					request_id,
+					peer,
+					key.0.to_hex::<String>(),
+					request.first,
+					request.last,
+					error
+				);
+				ChangesProof::<B::Header> {
+					max_block: Zero::zero(),
+					proof: Vec::new(),
+					roots: BTreeMap::new(),
+					roots_proof: Vec::new()
+				}
+			}
+		};
+
+		let response = {
+			let r = api::v1::light::RemoteChangesResponse {
+				max: proof.max_block.encode(),
+				proof: proof.proof,
+				roots: proof.roots.into_iter()
+					.map(|(k, v)| api::v1::light::Pair { fst: k.encode(), snd: v.encode() })
+					.collect(),
+				roots_proof: proof.roots_proof
+			};
+			api::v1::light::response::Response::RemoteChangesResponse(r)
+		};
+
+		Ok(api::v1::light::Response { id: request_id, response: Some(response) })
+	}
+
+	fn on_finality_proof_request
+		( &mut self
+		, peer: &PeerId
+		, request_id: u64
+		, request: &api::v1::light::FinalityProofRequest
+		) -> Result<api::v1::light::Response, Error>
+	{
+		trace!(target: "sync", "Finality proof request {} from {} for {:?}", request_id, peer, request.block);
+
+		let block = Decode::decode(&mut request.block.as_ref())?;
+
+		let proof =
+			if let Some(provider) = &self.finality_proof_provider {
+				match provider.prove_finality(block, &request.request) {
+					Ok(p) => p.unwrap_or(Vec::new()),
+					Err(e) => {
+						trace!(target: "sync", "Finality proof request {} from {} for {:?} failed with: {}",
+							request_id,
+							peer,
+							request.block,
+							e);
+						Vec::new()
+					}
+				}
+			} else {
+				return Err(io::Error::new(io::ErrorKind::Other, "Finality provider is not configured").into())
+			};
+
+		let response = {
+			let r = api::v1::light::FinalityProofResponse { block: request.block.clone(), proof };
+			api::v1::light::response::Response::FinalityProofResponse(r)
+		};
+
+		Ok(api::v1::light::Response { id: request_id, response: Some(response) })
 	}
 }
 
@@ -116,13 +341,57 @@ where
 	}
 
 	fn inject_node_event(&mut self, peer: PeerId, Request(request, stream): Request<T>) {
+		let result = match &request.request {
+			Some(api::v1::light::request::Request::RemoteCallRequest(r)) =>
+				self.on_remote_call_request(&peer, request.id, r),
+			Some(api::v1::light::request::Request::RemoteReadRequest(r)) =>
+				self.on_remote_read_request(&peer, request.id, r),
+			Some(api::v1::light::request::Request::RemoteHeaderRequest(r)) =>
+				self.on_remote_header_request(&peer, request.id, r),
+			Some(api::v1::light::request::Request::RemoteReadChildRequest(_)) => {
+				trace!("ignoring remote read child request {} from {}", request.id, peer);
+				return
+			}
+			Some(api::v1::light::request::Request::RemoteChangesRequest(r)) =>
+				self.on_remote_changes_request(&peer, request.id, r),
+			Some(api::v1::light::request::Request::FinalityProofRequest(r)) =>
+				self.on_finality_proof_request(&peer, request.id, r),
+			None => {
+				debug!("ignoring request {} without request data from peer {}", request.id, peer);
+				return
+			}
+		};
+
+		match result {
+			Ok(response) => {
+				trace!("enqueueing response {} for peer {}", response.id, peer);
+				let mut data = Vec::new();
+				if let Err(e) = response.encode(&mut data) {
+					debug!("error encoding response {} for peer {}: {}", response.id, peer, e)
+				} else {
+					self.outgoing.push_back(write_one(stream, data))
+				}
+			}
+			Err(e) => debug!("error handling request {} from peer {}: {}", request.id, peer, e)
+		}
 	}
 
 	fn poll(&mut self, _: &mut impl PollParameters) -> Async<NetworkBehaviourAction<DeniedUpgrade, Void>> {
+		let mut remaining = self.outgoing.len();
+		while let Some(mut write_future) = self.outgoing.pop_front() {
+			remaining -= 1;
+			match write_future.poll() {
+				Ok(Async::NotReady) => self.outgoing.push_back(write_future),
+				Ok(Async::Ready(())) => {}
+				Err(e) => debug!("error writing response: {}", e)
+			}
+			if remaining == 0 {
+				break
+			}
+		}
 		Async::NotReady
 	}
 }
-
 
 // TODO (after https://github.com/libp2p/rust-libp2p/pull/1226): #[derive(Debug)]
 pub struct Request<T>(api::v1::light::Request, Negotiated<T>);

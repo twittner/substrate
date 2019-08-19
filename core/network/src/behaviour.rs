@@ -44,6 +44,8 @@ pub struct Behaviour<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> {
 	discovery: DiscoveryBehaviour<Substream<StreamMuxerBox>>,
 	/// Block request handling.
 	block_requests: protocol::BlockRequests<Substream<StreamMuxerBox>, B>,
+	/// Light client request handling.
+	light_client_handler: protocol::LightClientHandler<Substream<StreamMuxerBox>, B>,
 
 	/// Queue of events to produce for the outside.
 	#[behaviour(ignore)]
@@ -64,14 +66,16 @@ impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> Behaviour<B, S, H> {
 		local_public_key: PublicKey,
 		known_addresses: Vec<(PeerId, Multiaddr)>,
 		enable_mdns: bool,
-		block_requests: protocol::BlockRequests<Substream<StreamMuxerBox>, B>
+		block_requests: protocol::BlockRequests<Substream<StreamMuxerBox>, B>,
+		light_client_handler: protocol::LightClientHandler<Substream<StreamMuxerBox>, B>
 	) -> Self {
 		Behaviour {
 			substrate,
 			debug_info: debug_info::DebugInfoBehaviour::new(user_agent, local_public_key.clone()),
 			discovery: DiscoveryBehaviour::new(local_public_key, known_addresses, enable_mdns),
 			block_requests,
-			events: Vec::new(),
+			light_client_handler,
+			events: Vec::new()
 		}
 	}
 
