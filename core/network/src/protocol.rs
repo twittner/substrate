@@ -50,7 +50,7 @@ use crate::error;
 use util::LruHashSet;
 
 // Include sources generated from protobuf definitions.
-mod api {
+pub mod api {
 	pub mod v1 {
 		include!(concat!(env!("OUT_DIR"), "/api.v1.rs"));
 		pub mod light {

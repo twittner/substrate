@@ -20,7 +20,7 @@ use crate::{
 	chain::{Client, FinalityProofProvider},
 	protocol::api
 };
-use futures::{future::{self, FutureResult}, prelude::*};
+use futures::prelude::*;
 use libp2p::{
 	core::{
 		ConnectedPoint,
@@ -44,7 +44,6 @@ use std::{
 	time::Duration
 };
 use tokio_io::{AsyncRead, AsyncWrite};
-use void::{Void, unreachable};
 
 // Type alias for convenience.
 pub type Error = Box<dyn std::error::Error + 'static>;
@@ -91,8 +90,6 @@ impl Config {
 	}
 }
 
-type OnResponse = fn(Vec<u8>, ()) -> Result<api::v1::light::Response, ReadOneError>;
-
 /// The light client handler behaviour.
 // TODO (after https://github.com/libp2p/rust-libp2p/pull/1226): #[derive(Debug)]
 pub struct LightClientHandler<T, B: Block> {
@@ -103,13 +100,11 @@ pub struct LightClientHandler<T, B: Block> {
 	/// When asked for a proof of finality, we use this struct to build one.
 	finality_proof_provider: Option<Arc<dyn FinalityProofProvider<B>>>,
 	/// Pending response futures.
-	replies: VecDeque<WriteOne<Negotiated<T>, Vec<u8>>>,
+	responses: VecDeque<WriteOne<Negotiated<T>, Vec<u8>>>,
 	/// Pending requests.
-	pending: VecDeque<api::v1::light::Request>,
-	/// Request in flight.
-	requests: VecDeque<RequestResponse<Negotiated<T>, (), OnResponse, Vec<u8>>>,
-	/// Request ID counter.
-	next_id: u64
+	requests: VecDeque<(PeerId, api::v1::light::Request)>,
+	/// Responses received from remote.
+	events: VecDeque<api::v1::light::Response>
 }
 
 impl<T, B> LightClientHandler<T, B>
@@ -122,10 +117,9 @@ where
 			config: cfg,
 			chain,
 			finality_proof_provider: None,
-			replies: VecDeque::new(),
-			pending: VecDeque::new(),
+			responses: VecDeque::new(),
 			requests: VecDeque::new(),
-			next_id: 1
+			events: VecDeque::new()
 		}
 	}
 
@@ -133,20 +127,24 @@ where
 		self.finality_proof_provider = p
 	}
 
-	pub fn remote_call_request(&mut self, request: fetcher::RemoteCallRequest<B::Header>) -> u64 {
-		let id = self.next_id;
-		self.next_id += 1;
+	pub fn remote_call_request
+		( &mut self
+		, peer: PeerId
+		, id: u64
+		, block: B::Hash
+		, method: String
+		, data: Vec<u8>
+		)
+	{
 		let request = {
 			let r = api::v1::light::RemoteCallRequest {
-				block: request.block.encode(),
-				method: request.method,
-				data: request.call_data
+				block: block.encode(),
+				method,
+				data
 			};
 			api::v1::light::request::Request::RemoteCallRequest(r)
 		};
-		// TODO: Maintain limit
-		self.pending.push_back(api::v1::light::Request { id, request: Some(request) });
-		id
+		self.requests.push_back((peer, api::v1::light::Request { id, request: Some(request) }))
 	}
 
 	fn on_remote_call_request
@@ -355,11 +353,11 @@ where
 	T: AsyncRead + AsyncWrite,
 	B: Block
 {
-	type ProtocolsHandler = OneShotHandler<T, Protocol, Protocol, Event<T>>;
-	type OutEvent = Void;
+	type ProtocolsHandler = OneShotHandler<T, InboundProtocol, OutboundProtocol, Event<T>>;
+	type OutEvent = api::v1::light::Response;
 
 	fn new_handler(&mut self) -> Self::ProtocolsHandler {
-		let p = Protocol {
+		let p = InboundProtocol {
 			max_data_size: self.config.max_data_size
 		};
 		OneShotHandler::new(SubstreamProtocol::new(p), self.config.inactivity_timeout)
@@ -377,7 +375,7 @@ where
 
 	fn inject_node_event(&mut self, peer: PeerId, event: Event<T>) {
 		match event {
-			Event::Inbound(request, stream) => {
+			Event::Request(request, stream) => {
 				let result = match &request.request {
 					Some(api::v1::light::request::Request::RemoteCallRequest(r)) =>
 						self.on_remote_call_request(&peer, request.id, r),
@@ -405,38 +403,41 @@ where
 						if let Err(e) = response.encode(&mut data) {
 							debug!("error encoding response {} for peer {}: {}", response.id, peer, e)
 						} else {
-							self.replies.push_back(write_one(stream, data))
+							self.responses.push_back(write_one(stream, data))
 						}
 					}
 					Err(e) => debug!("error handling request {} from peer {}: {}", request.id, peer, e)
 				}
 			}
-			Event::Outbound(stream) => {
-				if let Some(req) = self.pending.pop_front() {
-					let mut buf = Vec::with_capacity(req.encoded_len());
-					if let Err(e) = req.encode(&mut buf) {
-						debug!("failed to serialise request as protobuf: {}", e)
-					}
-					let on_response: OnResponse = |data, ()| {
-						api::v1::light::Response::decode(data)
-							.map_err(|e| {
-								ReadOneError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
-							})
-					};
-					let io = request_response(stream, buf, self.config.max_data_size, (), on_response);
-					self.requests.push_back(io)
-				}
+			Event::Response(response) => {
+				self.events.push_back(response)
 			}
 		}
 	}
 
-	fn poll(&mut self, _: &mut impl PollParameters) -> Async<NetworkBehaviourAction<Protocol, Void>> {
-		// First, continue sending responses to the remote.
-		let mut remaining = self.replies.len();
-		while let Some(mut io) = self.replies.pop_front() {
+	fn poll(&mut self, _: &mut impl PollParameters) -> Async<NetworkBehaviourAction<OutboundProtocol, api::v1::light::Response>> {
+		if let Some(response) = self.events.pop_front() {
+			return Async::Ready(NetworkBehaviourAction::GenerateEvent(response))
+		}
+
+		if let Some((peer, request)) = self.requests.pop_front() {
+			let mut buf = Vec::with_capacity(request.encoded_len());
+			if let Err(e) = request.encode(&mut buf) {
+				debug!("failed to serialise request {} for peer {}: {}", request.id, peer, e)
+			} else {
+				let protocol = OutboundProtocol {
+					request: buf,
+					max_data_size: self.config.max_data_size
+				};
+				return Async::Ready(NetworkBehaviourAction::SendEvent { peer_id: peer, event: protocol })
+			}
+		}
+
+		let mut remaining = self.responses.len();
+		while let Some(mut io) = self.responses.pop_front() {
 			remaining -= 1;
 			match io.poll() {
-				Ok(Async::NotReady) => self.replies.push_back(io),
+				Ok(Async::NotReady) => self.responses.push_back(io),
 				Ok(Async::Ready(())) => {}
 				Err(e) => debug!("error writing response: {}", e)
 			}
@@ -445,51 +446,30 @@ where
 			}
 		}
 
-		// Now, try to make progress with our own requests.
-		let mut remaining = self.requests.len();
-		while let Some(mut io) = self.requests.pop_front() {
-			remaining -= 1;
-			match io.poll() {
-				Ok(Async::NotReady) => self.requests.push_back(io),
-				Ok(Async::Ready(response)) => {} // TODO
-				Err(e) => debug!("error writing response: {}", e)
-			}
-			if remaining == 0 {
-				break
-			}
-		}
-
-		// If we have pending requests to send, ask for another substream
-		if !self.pending.is_empty() {
-			// TODO?
-		}
-
 		Async::NotReady
 	}
 }
 
 // TODO (after https://github.com/libp2p/rust-libp2p/pull/1226): #[derive(Debug)]
 pub enum Event<T> {
-	/// An inbound request from remote.
-	Inbound(api::v1::light::Request, Negotiated<T>),
-	/// An outbound connection stream over which to send a request.
-	Outbound(Negotiated<T>)
+	Request(api::v1::light::Request, Negotiated<T>),
+	Response(api::v1::light::Response)
 }
 
-impl<T> From<Void> for Event<T> {
-	fn from(v: Void) -> Self {
-		unreachable(v)
+impl<T> From<api::v1::light::Response> for Event<T> {
+	fn from(r: api::v1::light::Response) -> Self {
+		Event::Response(r)
 	}
 }
 
 /// Substream upgrade protocol.
 #[derive(Debug, Clone)]
-pub struct Protocol {
+pub struct InboundProtocol {
 	/// The max. request length in bytes.
 	max_data_size: usize
 }
 
-impl UpgradeInfo for Protocol {
+impl UpgradeInfo for InboundProtocol {
     type Info = &'static [u8];
     type InfoIter = iter::Once<Self::Info>;
 
@@ -498,7 +478,7 @@ impl UpgradeInfo for Protocol {
     }
 }
 
-impl<T: AsyncRead> InboundUpgrade<T> for Protocol {
+impl<T: AsyncRead> InboundUpgrade<T> for InboundProtocol {
     type Output = Event<T>;
     type Error = ReadOneError;
     type Future = ReadRespond<Negotiated<T>, (), fn(Negotiated<T>, Vec<u8>, ()) -> Result<Self::Output, Self::Error>>;
@@ -506,7 +486,7 @@ impl<T: AsyncRead> InboundUpgrade<T> for Protocol {
     fn upgrade_inbound(self, s: Negotiated<T>, _: Self::Info) -> Self::Future {
 		read_respond(s, self.max_data_size, (), |s, buf, ()| {
 			api::v1::light::Request::decode(buf)
-				.map(move |r| Event::Inbound(r, s))
+				.map(move |r| Event::Request(r, s))
 				.map_err(|decode_error| {
 					ReadOneError::Io(std::io::Error::new(std::io::ErrorKind::Other, decode_error))
 				})
@@ -514,12 +494,36 @@ impl<T: AsyncRead> InboundUpgrade<T> for Protocol {
 	}
 }
 
-impl<T> OutboundUpgrade<T> for Protocol {
-    type Output = Event<T>;
-    type Error = Void;
-    type Future = FutureResult<Self::Output, Self::Error>;
+#[derive(Debug, Clone)]
+pub struct OutboundProtocol {
+	/// The serialised protobuf request.
+	request: Vec<u8>,
+	/// The max. request length in bytes.
+	max_data_size: usize
+}
+
+impl UpgradeInfo for OutboundProtocol {
+    type Info = &'static [u8];
+    type InfoIter = iter::Once<Self::Info>;
+
+    fn protocol_info(&self) -> Self::InfoIter {
+        iter::once(b"/polkadot/light/1")
+    }
+}
+
+type OnResponse = fn(Vec<u8>, ()) -> Result<api::v1::light::Response, ReadOneError>;
+
+impl<T: AsyncRead + AsyncWrite> OutboundUpgrade<T> for OutboundProtocol {
+    type Output = api::v1::light::Response;
+    type Error = ReadOneError;
+    type Future = RequestResponse<Negotiated<T>, (), OnResponse, Vec<u8>>;
 
     fn upgrade_outbound(self, s: Negotiated<T>, _: Self::Info) -> Self::Future {
-		future::ok(Event::Outbound(s))
+		request_response(s, self.request, self.max_data_size, (), |data, ()| {
+			api::v1::light::Response::decode(data)
+				.map_err(|decode_error| {
+					ReadOneError::Io(std::io::Error::new(std::io::ErrorKind::Other, decode_error))
+				})
+		})
 	}
 }

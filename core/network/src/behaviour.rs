@@ -126,6 +126,16 @@ Behaviour<B, S, H> {
 	}
 }
 
+impl<B, S, H> NetworkBehaviourEventProcess<crate::protocol::api::v1::light::Response> for Behaviour<B, S, H>
+	where B: BlockT,
+		  S: NetworkSpecialization<B>,
+		  H: ExHashT
+{
+	fn inject_event(&mut self, event: protocol::api::v1::light::Response) {
+		unimplemented!()
+	}
+}
+
 impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> NetworkBehaviourEventProcess<CustomMessageOutcome<B>> for
 Behaviour<B, S, H> {
 	fn inject_event(&mut self, event: CustomMessageOutcome<B>) {
