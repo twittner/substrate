@@ -15,12 +15,12 @@
 // the `NetworkBehaviour`'s protocol handler (`OneShotHandler`).
 
 use codec::{Encode, Decode};
-use client::light::fetcher;
+use client::{error::Error as ClientError, light::fetcher};
 use crate::{
 	chain::{Client, FinalityProofProvider},
-	protocol::api
+	protocol::{self, api}
 };
-use futures::prelude::*;
+use futures::{prelude::*, sync::oneshot};
 use libp2p::{
 	core::{
 		ConnectedPoint,
@@ -35,15 +35,16 @@ use log::{debug, trace};
 use primitives::storage::StorageKey;
 use prost::Message;
 use rustc_hex::ToHex;
-use sr_primitives::traits::{Block, Zero};
+use sr_primitives::traits::{Block, NumberFor, Zero};
 use std::{
-	collections::{BTreeMap, VecDeque},
+	collections::{BTreeMap, VecDeque, HashMap, HashSet, hash_map::Entry},
 	io,
-	iter,
+	iter::{self, FromIterator},
 	sync::Arc,
 	time::Duration
 };
 use tokio_io::{AsyncRead, AsyncWrite};
+use void::Void;
 
 // Type alias for convenience.
 pub type Error = Box<dyn std::error::Error + 'static>;
@@ -98,6 +99,21 @@ impl Config {
 	}
 }
 
+#[derive(Debug, Default)]
+struct PeerInfo<B: Block> {
+	addresses: HashSet<Multiaddr>,
+	best_block: Option<NumberFor<B>>
+}
+
+#[derive(Debug)]
+enum Sender<B: Block> {
+	Extrinsics(oneshot::Sender<Result<Vec<B::Extrinsic>, ClientError>>),
+	Header(oneshot::Sender<Result<B::Header, ClientError>>),
+	OptBytes(oneshot::Sender<Result<Option<Vec<u8>>, ClientError>>),
+	Bytes(oneshot::Sender<Result<Vec<u8>, ClientError>>),
+	NumberPair(oneshot::Sender<Result<Vec<(NumberFor<B>, u32)>, ClientError>>)
+}
+
 /// The light client handler behaviour.
 // TODO (after https://github.com/libp2p/rust-libp2p/pull/1226): #[derive(Debug)]
 pub struct LightClientHandler<T, B: Block> {
@@ -107,10 +123,14 @@ pub struct LightClientHandler<T, B: Block> {
 	chain: Arc<dyn Client<B>>,
 	/// When asked for a proof of finality, we use this struct to build one.
 	finality_proof_provider: Option<Arc<dyn FinalityProofProvider<B>>>,
+	/// Peer information (addresses, their best block, etc.)
+	peers: HashMap<PeerId, PeerInfo<B>>,
 	/// Pending response futures.
 	responses: VecDeque<WriteOne<Negotiated<T>, Vec<u8>>>,
 	/// Pending requests.
 	requests: VecDeque<api::v1::light::Request>,
+	/// Clients waiting for a response.
+	clients: HashMap<u64, Sender<B>>,
 	/// Request ID counter
 	next_request_id: u64
 }
@@ -125,6 +145,8 @@ where
 			config: cfg,
 			chain,
 			finality_proof_provider: None,
+			peers: HashMap::new(),
+			clients: HashMap::new(),
 			responses: VecDeque::new(),
 			requests: VecDeque::new(),
 			next_request_id: 1
@@ -135,7 +157,13 @@ where
 		self.finality_proof_provider = p
 	}
 
-	pub fn request(&mut self, request_data: protocol::RequestData<B>) {
+	pub fn update_best_block(&mut self, peer: &PeerId, num: NumberFor<B>) {
+		self.peers.get_mut(peer).map(|info| {
+			info.best_block = Some(num)
+		});
+	}
+
+	pub(crate) fn request(&mut self, request_data: protocol::RequestData<B>) {
 		let id = self.next_request_id;
 		self.next_request_id += 1;
 
@@ -149,10 +177,31 @@ where
 					};
 					api::v1::light::request::Request::RemoteCallRequest(r)
 				};
-				self.requests.push_back(api::v1::light::Request { id, request: Some(request) })
+				self.requests.push_back(api::v1::light::Request { id, request: Some(request) });
+				self.clients.insert(id, Sender::Bytes(sender));
 			}
 			_ => unimplemented!()
 		}
+	}
+
+	fn peers_with_block(&mut self, num: NumberFor<B>) -> impl Iterator<Item = &PeerId> + '_ {
+		self.peers.iter().filter_map(move |(peer, info)| {
+			if info.best_block >= Some(num) {
+				Some(peer)
+			} else {
+				None
+			}
+		})
+	}
+
+	fn peers_with_unknown_block(&mut self) -> impl Iterator<Item = &PeerId> + '_ {
+		self.peers.iter().filter_map(|(peer, info)| {
+			if info.best_block.is_none() {
+				Some(peer)
+			} else {
+				None
+			}
+		})
 	}
 
 	fn on_remote_call_request
@@ -362,7 +411,7 @@ where
 	B: Block
 {
 	type ProtocolsHandler = OneShotHandler<T, InboundProtocol, OutboundProtocol, Event<T>>;
-	type OutEvent = api::v1::light::Response;
+	type OutEvent = Void;
 
 	fn new_handler(&mut self) -> Self::ProtocolsHandler {
 		let p = InboundProtocol {
@@ -371,14 +420,39 @@ where
 		OneShotHandler::new(SubstreamProtocol::new(p), self.config.inactivity_timeout)
 	}
 
-	fn addresses_of_peer(&mut self, _: &PeerId) -> Vec<Multiaddr> {
-		Vec::new()
+	fn addresses_of_peer(&mut self, peer: &PeerId) -> Vec<Multiaddr> {
+		self.peers.get(peer)
+			.map(|info| info.addresses.iter().cloned().collect())
+			.unwrap_or_default()
 	}
 
-	fn inject_connected(&mut self, _peer: PeerId, _info: ConnectedPoint) {
+	fn inject_connected(&mut self, peer: PeerId, info: ConnectedPoint) {
+		let peer_address = match info {
+			ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr,
+			ConnectedPoint::Dialer { address } => address
+		};
+		trace!("peer {} connected with address {}", peer, peer_address);
+		match self.peers.entry(peer) {
+			Entry::Vacant(e) => {
+				let info = PeerInfo {
+					addresses: HashSet::from_iter(iter::once(peer_address)),
+					best_block: None
+				};
+				e.insert(info);
+			}
+			Entry::Occupied(mut e) => {
+				e.get_mut().addresses.insert(peer_address);
+			}
+		}
 	}
 
-	fn inject_disconnected(&mut self, _peer: &PeerId, _info: ConnectedPoint) {
+	fn inject_disconnected(&mut self, peer: &PeerId, info: ConnectedPoint) {
+		let peer_address = match info {
+			ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr,
+			ConnectedPoint::Dialer { address } => address
+		};
+		trace!("peer {} with address {} disconnected", peer, peer_address);
+		self.peers.get_mut(peer).map(|info| info.addresses.remove(&peer_address));
 	}
 
 	fn inject_node_event(&mut self, peer: PeerId, event: Event<T>) {
@@ -418,22 +492,21 @@ where
 				}
 			}
 			Event::Response(response) => {
-				self.events.push_back(response)
 			}
 		}
 	}
 
 	fn poll(&mut self, _: &mut impl PollParameters) -> Async<NetworkBehaviourAction<OutboundProtocol, Void>> {
-		if let Some((peer, request)) = self.requests.pop_front() {
+		if let Some(request) = self.requests.pop_front() {
 			let mut buf = Vec::with_capacity(request.encoded_len());
 			if let Err(e) = request.encode(&mut buf) {
-				debug!("failed to serialise request {} for peer {}: {}", request.id, peer, e)
+				debug!("failed to serialise request {}: {}", request.id, e)
 			} else {
 				let protocol = OutboundProtocol {
 					request: buf,
 					max_data_size: self.config.max_data_size
 				};
-				return Async::Ready(NetworkBehaviourAction::SendEvent { peer_id: peer, event: protocol })
+				return Async::Ready(NetworkBehaviourAction::SendEvent { peer_id: unimplemented!(), event: protocol })
 			}
 		}
 
