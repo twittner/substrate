@@ -53,7 +53,8 @@ pub type Error = Box<dyn std::error::Error + 'static>;
 pub struct Config {
 	max_data_size: usize,
 	max_pending_requests: usize,
-	inactivity_timeout: Duration
+	inactivity_timeout: Duration,
+	max_retries: u8
 }
 
 impl Default for Config {
@@ -67,7 +68,8 @@ impl Config {
 		Config {
 			max_data_size: 1024 * 1024,
 			max_pending_requests: 32,
-			inactivity_timeout: Duration::from_secs(5)
+			inactivity_timeout: Duration::from_secs(5),
+			max_retries: 1
 		}
 	}
 
@@ -88,6 +90,12 @@ impl Config {
 		self.inactivity_timeout = v;
 		self
 	}
+
+	/// Limit the max. number of request retries.
+	pub fn set_max_retries(&mut self, v: u8) -> &mut Self {
+		self.max_retries = v;
+		self
+	}
 }
 
 /// The light client handler behaviour.
@@ -102,9 +110,9 @@ pub struct LightClientHandler<T, B: Block> {
 	/// Pending response futures.
 	responses: VecDeque<WriteOne<Negotiated<T>, Vec<u8>>>,
 	/// Pending requests.
-	requests: VecDeque<(PeerId, api::v1::light::Request)>,
-	/// Responses received from remote.
-	events: VecDeque<api::v1::light::Response>
+	requests: VecDeque<api::v1::light::Request>,
+	/// Request ID counter
+	next_request_id: u64
 }
 
 impl<T, B> LightClientHandler<T, B>
@@ -119,7 +127,7 @@ where
 			finality_proof_provider: None,
 			responses: VecDeque::new(),
 			requests: VecDeque::new(),
-			events: VecDeque::new()
+			next_request_id: 1
 		}
 	}
 
@@ -127,24 +135,24 @@ where
 		self.finality_proof_provider = p
 	}
 
-	pub fn remote_call_request
-		( &mut self
-		, peer: PeerId
-		, id: u64
-		, block: B::Hash
-		, method: String
-		, data: Vec<u8>
-		)
-	{
-		let request = {
-			let r = api::v1::light::RemoteCallRequest {
-				block: block.encode(),
-				method,
-				data
-			};
-			api::v1::light::request::Request::RemoteCallRequest(r)
-		};
-		self.requests.push_back((peer, api::v1::light::Request { id, request: Some(request) }))
+	pub fn request(&mut self, request_data: protocol::RequestData<B>) {
+		let id = self.next_request_id;
+		self.next_request_id += 1;
+
+		match request_data {
+			protocol::RequestData::RemoteCall(req, sender) => {
+				let request = {
+					let r = api::v1::light::RemoteCallRequest {
+						block: req.block.encode(),
+						method: req.method,
+						data: req.call_data
+					};
+					api::v1::light::request::Request::RemoteCallRequest(r)
+				};
+				self.requests.push_back(api::v1::light::Request { id, request: Some(request) })
+			}
+			_ => unimplemented!()
+		}
 	}
 
 	fn on_remote_call_request
@@ -415,11 +423,7 @@ where
 		}
 	}
 
-	fn poll(&mut self, _: &mut impl PollParameters) -> Async<NetworkBehaviourAction<OutboundProtocol, api::v1::light::Response>> {
-		if let Some(response) = self.events.pop_front() {
-			return Async::Ready(NetworkBehaviourAction::GenerateEvent(response))
-		}
-
+	fn poll(&mut self, _: &mut impl PollParameters) -> Async<NetworkBehaviourAction<OutboundProtocol, Void>> {
 		if let Some((peer, request)) = self.requests.pop_front() {
 			let mut buf = Vec::with_capacity(request.encoded_len());
 			if let Err(e) = request.encode(&mut buf) {
