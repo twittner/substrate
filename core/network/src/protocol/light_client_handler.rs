@@ -1,26 +1,10 @@
-//! `NetworkBehaviour` implementation which handles incoming light client
-//! requests.
-//!
-//! Every request is coming in on a separate connection substream which gets
-//! closed after we have sent the response back. Incoming requests are encoded
-//! as protocol buffers (cf. `light.v1.proto`).
-
-// Overview: We first define the various configuration options the
-// `LightClientHandler` struct supports. Then we define the struct itself with
-// its callback methods (e.g. `on_remote_call_request`) before defining the
-// implementation of the `NetworkBehaviour` trait for `LightClientHandler`.
-// Finally we specify `Protocol`, an `InboundUpgrade` for connection streams
-// which parses incoming protobuf messages and wraps them in a `Request` object
-// together with the actual connection substream. This `Protocol` is used by
-// the `NetworkBehaviour`'s protocol handler (`OneShotHandler`).
-
 use codec::{Encode, Decode};
-use client::{error::Error as ClientError, light::fetcher};
+use client::light::fetcher;
 use crate::{
 	chain::{Client, FinalityProofProvider},
 	protocol::{self, api}
 };
-use futures::{prelude::*, sync::oneshot};
+use futures::prelude::*;
 use libp2p::{
 	core::{
 		ConnectedPoint,
@@ -35,11 +19,11 @@ use log::{debug, trace};
 use primitives::storage::StorageKey;
 use prost::Message;
 use rustc_hex::ToHex;
-use sr_primitives::traits::{Block, NumberFor, Zero};
+use sr_primitives::traits::{Block, Header, NumberFor, Zero};
 use std::{
-	collections::{BTreeMap, VecDeque, HashMap, HashSet, hash_map::Entry},
+	collections::{BTreeMap, VecDeque, HashMap},
 	io,
-	iter::{self, FromIterator},
+	iter,
 	sync::Arc,
 	time::Duration
 };
@@ -54,8 +38,7 @@ pub type Error = Box<dyn std::error::Error + 'static>;
 pub struct Config {
 	max_data_size: usize,
 	max_pending_requests: usize,
-	inactivity_timeout: Duration,
-	max_retries: u8
+	inactivity_timeout: Duration
 }
 
 impl Default for Config {
@@ -68,9 +51,8 @@ impl Config {
 	pub fn new() -> Self {
 		Config {
 			max_data_size: 1024 * 1024,
-			max_pending_requests: 32,
-			inactivity_timeout: Duration::from_secs(5),
-			max_retries: 1
+			max_pending_requests: 128,
+			inactivity_timeout: Duration::from_secs(5)
 		}
 	}
 
@@ -91,27 +73,21 @@ impl Config {
 		self.inactivity_timeout = v;
 		self
 	}
-
-	/// Limit the max. number of request retries.
-	pub fn set_max_retries(&mut self, v: u8) -> &mut Self {
-		self.max_retries = v;
-		self
-	}
-}
-
-#[derive(Debug, Default)]
-struct PeerInfo<B: Block> {
-	addresses: HashSet<Multiaddr>,
-	best_block: Option<NumberFor<B>>
 }
 
 #[derive(Debug)]
-enum Sender<B: Block> {
-	Extrinsics(oneshot::Sender<Result<Vec<B::Extrinsic>, ClientError>>),
-	Header(oneshot::Sender<Result<B::Header, ClientError>>),
-	OptBytes(oneshot::Sender<Result<Option<Vec<u8>>, ClientError>>),
-	Bytes(oneshot::Sender<Result<Vec<u8>, ClientError>>),
-	NumberPair(oneshot::Sender<Result<Vec<(NumberFor<B>, u32)>, ClientError>>)
+struct PeerInfo<B: Block> {
+	address: Multiaddr,
+	best_block: Option<NumberFor<B>>,
+	status: PeerStatus
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PeerStatus {
+	/// The peer is available.
+	Idle,
+	/// We wait for the peer to return us a response for the given request ID.
+	BusyWith(u64)
 }
 
 /// The light client handler behaviour.
@@ -123,14 +99,16 @@ pub struct LightClientHandler<T, B: Block> {
 	chain: Arc<dyn Client<B>>,
 	/// When asked for a proof of finality, we use this struct to build one.
 	finality_proof_provider: Option<Arc<dyn FinalityProofProvider<B>>>,
+	/// Verifies that received responses are correct.
+	checker: Arc<dyn fetcher::FetchChecker<B>>,
 	/// Peer information (addresses, their best block, etc.)
 	peers: HashMap<PeerId, PeerInfo<B>>,
 	/// Pending response futures.
 	responses: VecDeque<WriteOne<Negotiated<T>, Vec<u8>>>,
 	/// Pending requests.
-	requests: VecDeque<api::v1::light::Request>,
-	/// Clients waiting for a response.
-	clients: HashMap<u64, Sender<B>>,
+	pending_requests: VecDeque<protocol::RequestData<B>>,
+	/// In flight requests.
+	outstanding: HashMap<u64, (PeerId, protocol::RequestData<B>)>,
 	/// Request ID counter
 	next_request_id: u64
 }
@@ -140,15 +118,16 @@ where
 	T: AsyncRead + AsyncWrite,
 	B: Block
 {
-	pub fn new(cfg: Config, chain: Arc<dyn Client<B>>) -> Self {
+	pub fn new(cfg: Config, chain: Arc<dyn Client<B>>, checker: Arc<dyn fetcher::FetchChecker<B>>) -> Self {
 		LightClientHandler {
 			config: cfg,
 			chain,
 			finality_proof_provider: None,
+			checker,
 			peers: HashMap::new(),
-			clients: HashMap::new(),
 			responses: VecDeque::new(),
-			requests: VecDeque::new(),
+			pending_requests: VecDeque::new(),
+			outstanding: HashMap::new(),
 			next_request_id: 1
 		}
 	}
@@ -163,45 +142,118 @@ where
 		});
 	}
 
-	pub(crate) fn request(&mut self, request_data: protocol::RequestData<B>) {
+	pub(crate) fn request(&mut self, request_data: protocol::RequestData<B>) -> Result<(), Error> {
+		if self.pending_requests.len() >= self.config.max_pending_requests {
+			return Err(std::io::Error::new(std::io::ErrorKind::Other, "too many pending requests").into())
+		}
+		self.pending_requests.push_back(request_data);
+		Ok(())
+	}
+
+	fn next_request_id(&mut self) -> u64 {
 		let id = self.next_request_id;
 		self.next_request_id += 1;
+		id
+	}
 
-		match request_data {
-			protocol::RequestData::RemoteCall(req, sender) => {
-				let request = {
-					let r = api::v1::light::RemoteCallRequest {
-						block: req.block.encode(),
-						method: req.method,
-						data: req.call_data
-					};
-					api::v1::light::request::Request::RemoteCallRequest(r)
-				};
-				self.requests.push_back(api::v1::light::Request { id, request: Some(request) });
-				self.clients.insert(id, Sender::Bytes(sender));
-			}
-			_ => unimplemented!()
+	fn idle_peers_with_block(&mut self, num: NumberFor<B>) -> impl Iterator<Item = PeerId> + '_ {
+		self.peers.iter()
+			.filter(move |(_, info)| {
+				info.status == PeerStatus::Idle && info.best_block >= Some(num)
+			})
+			.map(|(peer, _)| peer.clone())
+	}
+
+	fn idle_peers_with_unknown_block(&mut self) -> impl Iterator<Item = PeerId> + '_ {
+		self.peers.iter()
+			.filter(|(_, info)| {
+				info.status == PeerStatus::Idle && info.best_block.is_none()
+			})
+			.map(|(peer, _)| peer.clone())
+	}
+
+	fn remove_peer(&mut self, peer: &PeerId) {
+		// If we have a request in flight, we move it back to (the front of) the pending requests queue.
+		if let Some(id) = self.outstanding.iter().find(|(_, (p, _))| p == peer).map(|(k, _)| *k) {
+			let (_, request_data) = self.outstanding.remove(&id).expect("key belongs to entry in this map");
+			self.pending_requests.push_front(request_data);
 		}
+		let _info = self.peers.remove(peer);
+		debug_assert!(_info.is_some())
 	}
 
-	fn peers_with_block(&mut self, num: NumberFor<B>) -> impl Iterator<Item = &PeerId> + '_ {
-		self.peers.iter().filter_map(move |(peer, info)| {
-			if info.best_block >= Some(num) {
-				Some(peer)
-			} else {
-				None
-			}
-		})
-	}
-
-	fn peers_with_unknown_block(&mut self) -> impl Iterator<Item = &PeerId> + '_ {
-		self.peers.iter().filter_map(|(peer, info)| {
-			if info.best_block.is_none() {
-				Some(peer)
-			} else {
-				None
-			}
-		})
+	fn on_response
+		( &mut self
+		, peer: &PeerId
+		, response: api::v1::light::Response
+		, request: protocol::RequestData<B>
+		) -> Result<(), Error>
+	{
+		trace!(target: "sync", "response {} from {}", response.id, peer);
+		use api::v1::light::response::Response;
+		match response.response {
+			Some(Response::RemoteCallResponse(res)) =>
+				if let protocol::RequestData::RemoteCall(req, sender) = request {
+					let reply = self.checker.check_execution_proof(&req, res.proof)?;
+					let _ = sender.send(Ok(reply));
+					Ok(())
+				} else {
+					Err(io::Error::new(io::ErrorKind::Other, "invalid response type").into())
+				}
+			Some(Response::RemoteReadResponse(res)) =>
+				match request {
+					protocol::RequestData::RemoteRead(req, sender) => {
+						let reply = self.checker.check_read_proof(&req, res.proof)?;
+						let _ = sender.send(Ok(reply));
+						Ok(())
+					}
+					protocol::RequestData::RemoteReadChild(req, sender) => {
+						let reply = self.checker.check_read_child_proof(&req, res.proof)?;
+						let _ = sender.send(Ok(reply));
+						Ok(())
+					}
+					_ => Err(io::Error::new(io::ErrorKind::Other, "invalid response type").into())
+				}
+			Some(Response::RemoteChangesResponse(res)) =>
+				if let protocol::RequestData::RemoteChanges(req, sender) = request {
+					let max_block = Decode::decode(&mut res.max.as_ref())?;
+					let roots = {
+						let mut r = BTreeMap::new();
+						for pair in res.roots {
+							let k = Decode::decode(&mut pair.fst.as_ref())?;
+							let v = Decode::decode(&mut pair.snd.as_ref())?;
+							r.insert(k, v);
+						}
+						r
+					};
+					let reply = self.checker.check_changes_proof(&req, fetcher::ChangesProof {
+						max_block,
+						proof: res.proof,
+						roots,
+						roots_proof: res.roots_proof
+					})?;
+					let _ = sender.send(Ok(reply));
+					Ok(())
+				} else {
+					Err(io::Error::new(io::ErrorKind::Other, "invalid response type").into())
+				}
+			Some(Response::RemoteHeaderResponse(res)) =>
+				if let protocol::RequestData::RemoteHeader(req, sender) = request {
+					let header =
+						if res.header.is_empty() {
+							None
+						} else {
+							Some(Decode::decode(&mut res.header.as_ref())?)
+						};
+					let reply = self.checker.check_header_proof(&req, header, res.proof)?;
+					let _ = sender.send(Ok(reply));
+					Ok(())
+				} else {
+					Err(io::Error::new(io::ErrorKind::Other, "invalid response type").into())
+				}
+			None => Err(io::Error::new(io::ErrorKind::Other, "missing response data").into()),
+			_ => Err(io::Error::new(io::ErrorKind::Other, "unhandled response type").into())
+		}
 	}
 
 	fn on_remote_call_request
@@ -422,7 +474,7 @@ where
 
 	fn addresses_of_peer(&mut self, peer: &PeerId) -> Vec<Multiaddr> {
 		self.peers.get(peer)
-			.map(|info| info.addresses.iter().cloned().collect())
+			.map(|info| vec![info.address.clone()])
 			.unwrap_or_default()
 	}
 
@@ -431,28 +483,22 @@ where
 			ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr,
 			ConnectedPoint::Dialer { address } => address
 		};
+
 		trace!("peer {} connected with address {}", peer, peer_address);
-		match self.peers.entry(peer) {
-			Entry::Vacant(e) => {
-				let info = PeerInfo {
-					addresses: HashSet::from_iter(iter::once(peer_address)),
-					best_block: None
-				};
-				e.insert(info);
-			}
-			Entry::Occupied(mut e) => {
-				e.get_mut().addresses.insert(peer_address);
-			}
-		}
+
+		let info = PeerInfo {
+			address: peer_address,
+			best_block: None,
+			status: PeerStatus::Idle
+		};
+
+		let _previous = self.peers.insert(peer, info);
+		debug_assert!(_previous.is_none())
 	}
 
-	fn inject_disconnected(&mut self, peer: &PeerId, info: ConnectedPoint) {
-		let peer_address = match info {
-			ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr,
-			ConnectedPoint::Dialer { address } => address
-		};
-		trace!("peer {} with address {} disconnected", peer, peer_address);
-		self.peers.get_mut(peer).map(|info| info.addresses.remove(&peer_address));
+	fn inject_disconnected(&mut self, peer: &PeerId, _: ConnectedPoint) {
+		trace!("peer {} disconnected", peer);
+		self.remove_peer(peer)
 	}
 
 	fn inject_node_event(&mut self, peer: PeerId, event: Event<T>) {
@@ -492,21 +538,82 @@ where
 				}
 			}
 			Event::Response(response) => {
+				let id = response.id;
+
+				// We first just check if the response is expected and originates from the expected peer.
+				if let Some((original_peer, _)) = self.outstanding.get(&id) {
+					if original_peer != &peer {
+						debug!("was expecting response {} from {} instead of {}", id, original_peer, peer);
+						return
+					}
+				} else {
+					debug!("unexpected response {} from peer {}", id, peer);
+					return
+				}
+
+				// Now that we know the response is legit, let's extract the original request data.
+				let request_data =
+					self.outstanding.remove(&id)
+						.expect("the response id refers to the same entry we looked up above")
+						.1;
+
+				if let Some(info) = self.peers.get_mut(&peer) {
+					if info.status != PeerStatus::BusyWith(response.id) {
+						// If we get here, something is wrong with our internal handling of peer
+						// status information. At any time, a single peer processes at most one
+						// request from us and its status should contain the request ID we are
+						// expecting a response for. If a peer would send us a response with a
+						// random ID, we should not have an entry for it in our `outstanding`
+						// map, so a malicious peer should not be able to get us here. It is our
+						// own fault and must be fixed!
+						panic!("unexpected peer status {:?} for {}", info.status, peer);
+					}
+					info.status = PeerStatus::Idle;
+					if let Err(e) = self.on_response(&peer, response, request_data) {
+						debug!("error handling response {} from peer {}: {}", id, peer, e)
+					}
+				} else {
+					// If we get here, something is wrong with our internal handling of peers.
+					// We apparently have an entry in our `outstanding` map and the peer is the one we
+					// expected. So, if we can not find an entry for it in our peer information table,
+					// then these two collections are out of sync which must not happen and is a clear
+					// programmer error that must be fixed!
+					panic!("missing peer information for {}; response {}", peer, id);
+				}
 			}
 		}
 	}
 
 	fn poll(&mut self, _: &mut impl PollParameters) -> Async<NetworkBehaviourAction<OutboundProtocol, Void>> {
-		if let Some(request) = self.requests.pop_front() {
-			let mut buf = Vec::with_capacity(request.encoded_len());
-			if let Err(e) = request.encode(&mut buf) {
-				debug!("failed to serialise request {}: {}", request.id, e)
+		// If we have a pending request to send, try to find an available peer and send it.
+		if let Some(request_data) = self.pending_requests.pop_front() {
+			let number = required_block(&request_data);
+			let available_peer = {
+				let p = self.idle_peers_with_block(number).next();
+				if p.is_none() {
+					self.idle_peers_with_unknown_block().next()
+				} else {
+					p
+				}
+			};
+			if let Some(peer) = available_peer {
+				let id = self.next_request_id();
+				let rq = serialise_request(id, &request_data);
+				let mut buf = Vec::with_capacity(rq.encoded_len());
+				if let Err(e) = rq.encode(&mut buf) {
+					debug!("failed to serialise request {}: {}", id, e)
+				} else {
+					let protocol = OutboundProtocol {
+						request: buf,
+						max_data_size: self.config.max_data_size
+					};
+					self.peers.get_mut(&peer).map(|info| info.status = PeerStatus::BusyWith(id));
+					self.outstanding.insert(id, (peer.clone(), request_data));
+					return Async::Ready(NetworkBehaviourAction::SendEvent { peer_id: peer, event: protocol })
+				}
 			} else {
-				let protocol = OutboundProtocol {
-					request: buf,
-					max_data_size: self.config.max_data_size
-				};
-				return Async::Ready(NetworkBehaviourAction::SendEvent { peer_id: unimplemented!(), event: protocol })
+				self.pending_requests.push_front(request_data);
+				debug!("no peer available to send request to")
 			}
 		}
 
@@ -524,6 +631,34 @@ where
 		}
 
 		Async::NotReady
+	}
+}
+
+fn required_block<B: Block>(request: &protocol::RequestData<B>) -> NumberFor<B> {
+	match request {
+		protocol::RequestData::RemoteHeader(data, _) => data.block,
+		protocol::RequestData::RemoteRead(data, _) => *data.header.number(),
+		protocol::RequestData::RemoteReadChild(data, _) => *data.header.number(),
+		protocol::RequestData::RemoteCall(data, _) => *data.header.number(),
+		protocol::RequestData::RemoteChanges(data, _) => data.max_block.0,
+		protocol::RequestData::RemoteBody(data, _) => *data.header.number()
+	}
+}
+
+fn serialise_request<B: Block>(id: u64, request: &protocol::RequestData<B>) -> api::v1::light::Request {
+	match request {
+		protocol::RequestData::RemoteCall(data, _) => {
+			let req = {
+				let r = api::v1::light::RemoteCallRequest {
+					block: data.block.encode(),
+					method: data.method.clone(),
+					data: data.call_data.clone()
+				};
+				api::v1::light::request::Request::RemoteCallRequest(r)
+			};
+			api::v1::light::Request { id, request: Some(req) }
+		}
+		_ => unimplemented!()
 	}
 }
 

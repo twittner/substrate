@@ -165,11 +165,15 @@ impl<B: BlockT + 'static, S: NetworkSpecialization<B>, H: ExHashT> NetworkWorker
 
 		let num_connected = Arc::new(AtomicUsize::new(0));
 		let is_major_syncing = Arc::new(AtomicBool::new(false));
+
+		let checker = params.on_demand.as_ref()
+			.map(|od| od.checker().clone())
+			.unwrap_or(Arc::new(AlwaysBadChecker));
+
 		let (protocol, peerset_handle) = Protocol::new(
 			protocol::ProtocolConfig { roles: params.roles },
 			params.chain.clone(),
-			params.on_demand.as_ref().map(|od| od.checker().clone())
-				.unwrap_or(Arc::new(AlwaysBadChecker)),
+			checker.clone(),
 			params.specialization,
 			params.transaction_pool,
 			params.finality_proof_provider.clone(),
@@ -191,7 +195,7 @@ impl<B: BlockT + 'static, S: NetworkSpecialization<B>, H: ExHashT> NetworkWorker
 			};
 			let light_client_handler = {
 				let config = protocol::light_client_handler::Config::default();
-				let mut handler = protocol::LightClientHandler::new(config, params.chain);
+				let mut handler = protocol::LightClientHandler::new(config, params.chain, checker);
 				handler.set_finality_proof_provider(params.finality_proof_provider);
 				handler
 			};
