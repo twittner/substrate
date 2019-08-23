@@ -12,7 +12,7 @@ use libp2p::{
 	},
 	swarm::{NetworkBehaviour, NetworkBehaviourAction, OneShotHandler, PollParameters, SubstreamProtocol}
 };
-use log::{debug, trace};
+use log::{debug, error, trace};
 use primitives::storage::StorageKey;
 use prost::Message;
 use rustc_hex::ToHex;
@@ -33,7 +33,7 @@ pub enum Error {
 	/// There are currently too many pending request.
 	TooManyRequests,
 	/// The response type does not correspond to the issued request.
-	UnexpectedResponse(api::v1::light::Response),
+	UnexpectedResponse,
 	/// The chain client errored.
 	Client(ClientError),
 	/// Encoding or decoding of some data failed.
@@ -44,7 +44,7 @@ impl fmt::Display for Error {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		match self {
 			Error::TooManyRequests => f.write_str("too many pending requests"),
-			Error::UnexpectedResponse(r) => write!(f, "unexpected response {}", r.id),
+			Error::UnexpectedResponse => f.write_str("unexpected response"),
 			Error::Client(e) => write!(f, "client error: {}", e),
 			Error::Codec(e) => write!(f, "codec error: {}", e)
 		}
@@ -56,7 +56,7 @@ impl std::error::Error for Error {
 		match self {
 			Error::Client(e) => Some(e),
 			Error::Codec(e) => Some(e),
-			Error::UnexpectedResponse(_) | Error::TooManyRequests => None
+			Error::UnexpectedResponse | Error::TooManyRequests => None
 		}
 	}
 }
@@ -281,7 +281,7 @@ where
 		, response: api::v1::light::Response
 		) -> Result<Reply<B>, Error>
 	{
-		trace!(target: "sync", "response {} from {}", response.id, peer);
+		trace!("response {} from {}", response.id, peer);
 		use api::v1::light::response::Response;
 		match response.response {
 			Some(Response::RemoteCallResponse(res)) =>
@@ -289,10 +289,7 @@ where
 					let reply = self.checker.check_execution_proof(req, res.proof)?;
 					Ok(Reply::VecU8(reply))
 				} else {
-					Err(Error::UnexpectedResponse(api::v1::light::Response {
-						id: response.id,
-						response: Some(Response::RemoteCallResponse(res))
-					}))
+					Err(Error::UnexpectedResponse)
 				}
 			Some(Response::RemoteReadResponse(res)) =>
 				match request {
@@ -304,10 +301,7 @@ where
 						let reply = self.checker.check_read_child_proof(&req, res.proof)?;
 						Ok(Reply::OptVecU8(reply))
 					}
-					_ => Err(Error::UnexpectedResponse(api::v1::light::Response {
-						id: response.id,
-						response: Some(Response::RemoteReadResponse(res))
-					}))
+					_ => Err(Error::UnexpectedResponse)
 				}
 			Some(Response::RemoteChangesResponse(res)) =>
 				if let LightClientRequest::Changes(req, _) = request {
@@ -329,10 +323,7 @@ where
 					})?;
 					Ok(Reply::VecNumberU32(reply))
 				} else {
-					Err(Error::UnexpectedResponse(api::v1::light::Response {
-						id: response.id,
-						response: Some(Response::RemoteChangesResponse(res))
-					}))
+					Err(Error::UnexpectedResponse)
 				}
 			Some(Response::RemoteHeaderResponse(res)) =>
 				if let LightClientRequest::Header(req, _) = request {
@@ -345,15 +336,9 @@ where
 					let reply = self.checker.check_header_proof(&req, header, res.proof)?;
 					Ok(Reply::Header(reply))
 				} else {
-					Err(Error::UnexpectedResponse(api::v1::light::Response {
-						id: response.id,
-						response: Some(Response::RemoteHeaderResponse(res))
-					}))
+					Err(Error::UnexpectedResponse)
 				}
-			None => Err(Error::UnexpectedResponse(api::v1::light::Response {
-				id: response.id,
-				response: None
-			}))
+			None => Err(Error::UnexpectedResponse)
 		}
 	}
 
@@ -364,19 +349,14 @@ where
 		, request: &api::v1::light::RemoteCallRequest
 		) -> Result<api::v1::light::Response, Error>
 	{
-		trace!(target: "sync", "Remote call request {} from {} ({} at {:?})",
-			request_id,
-			peer,
-			request.method,
-			request.block
-		);
+		trace!("remote call request {} from {} ({} at {:?})", request_id, peer, request.method, request.block);
 
 		let block = Decode::decode(&mut request.block.as_ref())?;
 
 		let proof = match self.chain.execution_proof(&block, &request.method, &request.data) {
 			Ok((_, proof)) => proof,
 			Err(e) => {
-				trace!(target: "sync", "Remote call request {} from {} ({} at {:?}) failed with: {}",
+				trace!("remote call request {} from {} ({} at {:?}) failed with: {}",
 					request_id,
 					peer,
 					request.method,
@@ -401,7 +381,7 @@ where
 		, request: &api::v1::light::RemoteReadRequest
 		) -> Result<api::v1::light::Response, Error>
 	{
-		trace!(target: "sync", "Remote read request {} from {} ({} at {:?})",
+		trace!("remote read request {} from {} ({} at {:?})",
 			request_id,
 			peer,
 			request.key.to_hex::<String>(),
@@ -412,7 +392,7 @@ where
 		let proof = match self.chain.read_proof(&block, &request.key) {
 			Ok(proof) => proof,
 			Err(error) => {
-				trace!(target: "sync", "Remote read request {} from {} ({} at {:?}) failed with: {}",
+				trace!("remote read request {} from {} ({} at {:?}) failed with: {}",
 					request_id,
 					peer,
 					request.key.to_hex::<String>(),
@@ -437,17 +417,14 @@ where
 		, request: &api::v1::light::RemoteHeaderRequest
 		) -> Result<api::v1::light::Response, Error>
 	{
-		trace!(target: "sync", "Remote header proof request {} from {} ({:?})",
-			request_id,
-			peer,
-			request.block);
+		trace!("remote header proof request {} from {} ({:?})", request_id, peer, request.block);
 
 		let block = Decode::decode(&mut request.block.as_ref())?;
 
 		let (header, proof) = match self.chain.header_proof(block) {
 			Ok((header, proof)) => (header.encode(), proof),
 			Err(error) => {
-				trace!(target: "sync", "Remote header proof request {} from {} ({:?}) failed with: {}",
+				trace!("remote header proof request {} from {} ({:?}) failed with: {}",
 					request_id,
 					peer,
 					request.block,
@@ -471,7 +448,7 @@ where
 		, request: &api::v1::light::RemoteChangesRequest
 		) -> Result<api::v1::light::Response, Error>
 	{
-		trace!(target: "sync", "Remote changes proof request {} from {} for key {} ({:?}..{:?})",
+		trace!("remote changes proof request {} from {} for key {} ({:?}..{:?})",
 			request_id,
 			peer,
 			request.key.to_hex::<String>(),
@@ -488,8 +465,7 @@ where
 		let proof = match self.chain.key_changes_proof(first, last, min, max, &key) {
 			Ok(proof) => proof,
 			Err(error) => {
-				trace!(target: "sync",
-					"Remote changes proof request {} from {} for key {} ({:?}..{:?}) failed with: {}",
+				trace!("remote changes proof request {} from {} for key {} ({:?}..{:?}) failed with: {}",
 					request_id,
 					peer,
 					key.0.to_hex::<String>(),
@@ -628,7 +604,7 @@ where
 
 						match self.on_response(&peer, &request.request, response) {
 							Ok(reply) => send_reply(reply, request.request),
-							Err(Error::UnexpectedResponse(r)) => {
+							Err(Error::UnexpectedResponse) => {
 								debug!("unexpected response {} from peer {}", id, peer);
 								self.remove_peer(&peer);
 								let rw = RequestWrapper {
@@ -803,25 +779,22 @@ fn send_reply<B: Block>(data: Reply<B>, request: LightClientRequest<B>) {
 		(Reply::VecNumberU32(x), LightClientRequest::Changes(_, sender)) => {
 			let _ = sender.send(Ok(x));
 		}
-		(reply, request) => {
-			panic!("invalid reply for request: {:?}, {:?}", reply, request)
-		}
+		(reply, request) => error!("invalid reply for request: {:?}, {:?}", reply, request)
 	}
 }
 
+/// Output type of inbound and outbound substream upgrades.
 // TODO (after https://github.com/libp2p/rust-libp2p/pull/1226): #[derive(Debug)]
 pub enum Event<T> {
+	/// Incoming request from remote and substream to use for the response.
 	Request(api::v1::light::Request, Negotiated<T>),
+	/// Incoming response from remote.
 	Response(api::v1::light::Response)
 }
 
-impl<T> From<api::v1::light::Response> for Event<T> {
-	fn from(r: api::v1::light::Response) -> Self {
-		Event::Response(r)
-	}
-}
-
 /// Substream upgrade protocol.
+///
+/// Reads incoming requests from remote.
 #[derive(Debug, Clone)]
 pub struct InboundProtocol {
 	/// The max. request length in bytes.
@@ -853,6 +826,9 @@ impl<T: AsyncRead> InboundUpgrade<T> for InboundProtocol {
 	}
 }
 
+/// Substream upgrade protocol.
+///
+/// Sends a request to remote and awaits the response.
 #[derive(Debug, Clone)]
 pub struct OutboundProtocol {
 	/// The serialised protobuf request.
@@ -870,19 +846,19 @@ impl UpgradeInfo for OutboundProtocol {
     }
 }
 
-type OnResponse = fn(Vec<u8>, ()) -> Result<api::v1::light::Response, ReadOneError>;
-
 impl<T: AsyncRead + AsyncWrite> OutboundUpgrade<T> for OutboundProtocol {
-    type Output = api::v1::light::Response;
+    type Output = Event<T>;
     type Error = ReadOneError;
-    type Future = RequestResponse<Negotiated<T>, (), OnResponse, Vec<u8>>;
+    type Future = RequestResponse<Negotiated<T>, (), fn(Vec<u8>, ()) -> Result<Event<T>, ReadOneError>, Vec<u8>>;
 
     fn upgrade_outbound(self, s: Negotiated<T>, _: Self::Info) -> Self::Future {
 		request_response(s, self.request, self.max_data_size, (), |data, ()| {
 			api::v1::light::Response::decode(data)
+				.map(Event::Response)
 				.map_err(|decode_error| {
 					ReadOneError::Io(std::io::Error::new(std::io::ErrorKind::Other, decode_error))
 				})
 		})
 	}
 }
+
