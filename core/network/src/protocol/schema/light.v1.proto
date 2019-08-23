@@ -22,7 +22,6 @@ message Request {
 		RemoteHeaderRequest remote_header_request = 4;
 		RemoteReadChildRequest remote_read_child_request = 5;
 		RemoteChangesRequest remote_changes_request = 6;
-		FinalityProofRequest finality_proof_request = 7;
 	}
 }
 
@@ -34,9 +33,7 @@ message Response {
 		RemoteCallResponse remote_call_response = 2;
 		RemoteReadResponse remote_read_response = 3;
 		RemoteHeaderResponse remote_header_response = 4;
-		RemoteReadChildRequest remote_read_child_response = 5;
 		RemoteChangesResponse remote_changes_response = 6;
-		FinalityProofResponse finality_proof_response = 7;
 	}
 }
 
@@ -120,21 +117,5 @@ message RemoteChangesResponse {
 	repeated Pair roots = 4;
 	// Missing changes tries roots proof.
 	repeated bytes roots_proof = 5;
-}
-
-// Finality proof request.
-message FinalityProofRequest {
-	/// Hash of the block to request proof for.
-	bytes block = 2;
-	/// Additional data blob (that both requester and provider understood) required for proving finality.
-	bytes request = 3;
-}
-
-// Finality proof response.
-message FinalityProofResponse {
-	/// Hash of the block (the same as in the FinalityProofRequest).
-	bytes block = 2;
-	/// Finality proof (if available).
-	bytes proof = 3;
 }
 

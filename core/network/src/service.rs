@@ -195,9 +195,7 @@ impl<B: BlockT + 'static, S: NetworkSpecialization<B>, H: ExHashT> NetworkWorker
 			};
 			let light_client_handler = {
 				let config = protocol::light_client_handler::Config::default();
-				let mut handler = protocol::LightClientHandler::new(config, params.chain, checker);
-				handler.set_finality_proof_provider(params.finality_proof_provider);
-				handler
+				protocol::LightClientHandler::new(config, params.chain, checker)
 			};
 			let behaviour = Behaviour::new(
 				protocol,
