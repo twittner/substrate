@@ -195,7 +195,7 @@ impl<B: BlockT + 'static, S: NetworkSpecialization<B>, H: ExHashT> NetworkWorker
 			};
 			let light_client_handler = {
 				let config = protocol::light_client_handler::Config::default();
-				protocol::LightClientHandler::new(config, params.chain, checker)
+				protocol::LightClientHandler::new(config, params.chain, checker, peerset_handle.clone())
 			};
 			let behaviour = Behaviour::new(
 				protocol,

@@ -22,7 +22,7 @@ use std::{
 	fmt,
 	iter,
 	sync::Arc,
-	time::Duration
+	time::{Duration, Instant}
 };
 use tokio_io::{AsyncRead, AsyncWrite};
 use void::Void;
@@ -78,7 +78,8 @@ impl From<codec::Error> for Error {
 pub struct Config {
 	max_data_size: usize,
 	max_pending_requests: usize,
-	inactivity_timeout: Duration
+	inactivity_timeout: Duration,
+	request_timeout: Duration
 }
 
 impl Default for Config {
@@ -92,7 +93,8 @@ impl Config {
 		Config {
 			max_data_size: 1024 * 1024,
 			max_pending_requests: 128,
-			inactivity_timeout: Duration::from_secs(5)
+			inactivity_timeout: Duration::from_secs(5),
+			request_timeout: Duration::from_secs(15)
 		}
 	}
 
@@ -108,9 +110,15 @@ impl Config {
 		self
 	}
 
-	/// Limit the max. duration the substream may remain inactive before closing it.
+	/// Limit the max. duration the connection may remain inactive before closing it.
 	pub fn set_inactivity_timeout(&mut self, v: Duration) -> &mut Self {
 		self.inactivity_timeout = v;
+		self
+	}
+
+	/// Limit the max. request duration.
+	pub fn set_request_timeout(&mut self, v: Duration) -> &mut Self {
+		self.request_timeout = v;
 		self
 	}
 }
@@ -144,6 +152,8 @@ enum Reply<B: Block> {
 /// Augments a light client request with metadata.
 #[derive(Debug)]
 struct RequestWrapper<B: Block, P> {
+	/// Time when this value was created.
+	timestamp: Instant,
 	/// Remaining retries.
 	retries: usize,
 	/// The actual request.
@@ -187,7 +197,9 @@ pub struct LightClientHandler<T, B: Block> {
 	/// In flight requests.
 	outstanding: HashMap<u64, RequestWrapper<B, PeerId>>,
 	/// Request ID counter
-	next_request_id: u64
+	next_request_id: u64,
+	/// Handle to use for reporting misbehaviour of peers.
+	peerset: peerset::PeersetHandle
 }
 
 impl<T, B> LightClientHandler<T, B>
@@ -195,7 +207,14 @@ where
 	T: AsyncRead + AsyncWrite,
 	B: Block
 {
-	pub fn new(cfg: Config, chain: Arc<dyn Client<B>>, checker: Arc<dyn fetcher::FetchChecker<B>>) -> Self {
+	/// Construct a new light client handler.
+	pub fn new
+		( cfg: Config
+		, chain: Arc<dyn Client<B>>
+		, checker: Arc<dyn fetcher::FetchChecker<B>>
+		, peerset: peerset::PeersetHandle
+		) -> Self
+	{
 		LightClientHandler {
 			config: cfg,
 			chain,
@@ -204,7 +223,8 @@ where
 			responses: VecDeque::new(),
 			pending_requests: VecDeque::new(),
 			outstanding: HashMap::new(),
-			next_request_id: 1
+			next_request_id: 1,
+			peerset
 		}
 	}
 
@@ -222,6 +242,7 @@ where
 			return Err(Error::TooManyRequests)
 		}
 		let rw = RequestWrapper {
+			timestamp: Instant::now(),
 			retries: retries(&req),
 			request: req,
 			peer: () // we do not know the peer yet
@@ -260,14 +281,14 @@ where
 		if let Some(id) = self.outstanding.iter().find(|(_, rw)| &rw.peer == peer).map(|(k, _)| *k) {
 			let rw = self.outstanding.remove(&id).expect("key belongs to entry in this map");
 			let rw = RequestWrapper {
+				timestamp: rw.timestamp,
 				retries: rw.retries,
 				request: rw.request,
 				peer: () // need to find another peer
 			};
-			self.pending_requests.push_front(rw);
+			self.pending_requests.push_back(rw);
 		}
-		let _info = self.peers.remove(peer);
-		debug_assert!(_info.is_some())
+		self.peers.remove(peer);
 	}
 
 	/// Process a request's response.
@@ -533,8 +554,7 @@ where
 			status: PeerStatus::Idle
 		};
 
-		let _previous = self.peers.insert(peer, info);
-		debug_assert!(_previous.is_none())
+		self.peers.insert(peer, info);
 	}
 
 	fn inject_disconnected(&mut self, peer: &PeerId, _: ConnectedPoint) {
@@ -585,6 +605,8 @@ where
 					if request.peer != peer {
 						debug!("was expecting response {} from {} instead of {}", id, request.peer, peer);
 						self.outstanding.insert(id, request);
+						self.peerset.report_peer(peer.clone(), i32::min_value());
+						self.remove_peer(&peer);
 						return
 					}
 
@@ -603,11 +625,13 @@ where
 						info.status = PeerStatus::Idle;
 
 						match self.on_response(&peer, &request.request, response) {
-							Ok(reply) => send_reply(reply, request.request),
+							Ok(reply) => send_reply(Ok(reply), request.request),
 							Err(Error::UnexpectedResponse) => {
 								debug!("unexpected response {} from peer {}", id, peer);
+								self.peerset.report_peer(peer.clone(), i32::min_value());
 								self.remove_peer(&peer);
 								let rw = RequestWrapper {
+									timestamp: request.timestamp,
 									retries: request.retries,
 									request: request.request,
 									peer: ()
@@ -616,13 +640,18 @@ where
 							}
 							Err(other) => {
 								debug!("error handling response {} from peer {}: {}", id, peer, other);
+								self.peerset.report_peer(peer.clone(), i32::min_value());
+								self.remove_peer(&peer);
 								if request.retries > 0 {
 									let rw = RequestWrapper {
+										timestamp: request.timestamp,
 										retries: request.retries - 1,
 										request: request.request,
 										peer: ()
 									};
 									self.pending_requests.push_back(rw)
+								} else {
+									send_reply(Err(ClientError::RemoteFetchFailed), request.request);
 								}
 							}
 						}
@@ -635,7 +664,9 @@ where
 						panic!("missing peer information for {}; response {}", peer, id);
 					}
 				} else {
-					debug!("unexpected response {} from peer {}", id, peer)
+					debug!("unexpected response {} from peer {}", id, peer);
+					self.peerset.report_peer(peer.clone(), i32::min_value());
+					self.remove_peer(&peer);
 				}
 			}
 		}
@@ -643,7 +674,13 @@ where
 
 	fn poll(&mut self, _: &mut impl PollParameters) -> Async<NetworkBehaviourAction<OutboundProtocol, Void>> {
 		// If we have a pending request to send, try to find an available peer and send it.
-		if let Some(request) = self.pending_requests.pop_front() {
+		let now = Instant::now();
+		while let Some(request) = self.pending_requests.pop_front() {
+			if now > request.timestamp + self.config.request_timeout {
+				debug!("pending request timed out");
+				send_reply(Err(ClientError::RemoteFetchFailed), request.request);
+				continue
+			}
 			let number = required_block(&request.request);
 			let available_peer = {
 				let p = self.idle_peers_with_block(number).next();
@@ -658,7 +695,8 @@ where
 				let rq = serialise_request(id, &request.request);
 				let mut buf = Vec::with_capacity(rq.encoded_len());
 				if let Err(e) = rq.encode(&mut buf) {
-					debug!("failed to serialise request {}: {}", id, e)
+					debug!("failed to serialise request {}: {}", id, e);
+					send_reply(Err(ClientError::RemoteFetchFailed), request.request)
 				} else {
 					let protocol = OutboundProtocol {
 						request: buf,
@@ -666,6 +704,7 @@ where
 					};
 					self.peers.get_mut(&peer).map(|info| info.status = PeerStatus::BusyWith(id));
 					let rw = RequestWrapper {
+						timestamp: request.timestamp,
 						retries: request.retries,
 						request: request.request,
 						peer: peer.clone()
@@ -675,7 +714,22 @@ where
 				}
 			} else {
 				self.pending_requests.push_front(request);
-				debug!("no peer available to send request to")
+				debug!("no peer available to send request to");
+				break
+			}
+		}
+
+		// Look for requests that have timed out.
+		let mut expired = Vec::new();
+		for (id, rw) in &self.outstanding {
+			if now > rw.timestamp + self.config.request_timeout {
+				debug!("request {} timed out", id);
+				expired.push(*id)
+			}
+		}
+		for id in expired {
+			if let Some(rw) = self.outstanding.remove(&id) {
+				send_reply(Err(ClientError::RemoteFetchFailed), rw.request)
 			}
 		}
 
@@ -762,24 +816,36 @@ fn serialise_request<B: Block>(id: u64, request: &LightClientRequest<B>) -> api:
 	api::v1::light::Request { id, request: Some(request) }
 }
 
-fn send_reply<B: Block>(data: Reply<B>, request: LightClientRequest<B>) {
-	match (data, request) {
-		(Reply::Header(x), LightClientRequest::Header(_, sender)) => {
-			let _ = sender.send(Ok(x));
+fn send_reply<B: Block>(result: Result<Reply<B>, ClientError>, request: LightClientRequest<B>) {
+	fn send<T>(item: T, sender: oneshot::Sender<T>) {
+		let _ = sender.send(item); // It is okay if the other end already hung up.
+	}
+	match request {
+		LightClientRequest::Header(req, sender) => match result {
+			Err(e) => send(Err(e), sender),
+			Ok(Reply::Header(x)) => send(Ok(x), sender),
+			reply => error!("invalid reply for header request: {:?}, {:?}", reply, req)
 		}
-		(Reply::OptVecU8(x), LightClientRequest::Read(_, sender)) => {
-			let _ = sender.send(Ok(x));
+		LightClientRequest::Read(req, sender) => match result {
+			Err(e) => send(Err(e), sender),
+			Ok(Reply::OptVecU8(x)) => send(Ok(x), sender),
+			reply => error!("invalid reply for read request: {:?}, {:?}", reply, req)
 		}
-		(Reply::OptVecU8(x), LightClientRequest::ReadChild(_, sender)) => {
-			let _ = sender.send(Ok(x));
+		LightClientRequest::ReadChild(req, sender) => match result {
+			Err(e) => send(Err(e), sender),
+			Ok(Reply::OptVecU8(x)) => send(Ok(x), sender),
+			reply => error!("invalid reply for read child request: {:?}, {:?}", reply, req)
 		}
-		(Reply::VecU8(x), LightClientRequest::Call(_, sender)) => {
-			let _ = sender.send(Ok(x));
+		LightClientRequest::Call(req, sender) => match result {
+			Err(e) => send(Err(e), sender),
+			Ok(Reply::VecU8(x)) => send(Ok(x), sender),
+			reply => error!("invalid reply for call request: {:?}, {:?}", reply, req)
 		}
-		(Reply::VecNumberU32(x), LightClientRequest::Changes(_, sender)) => {
-			let _ = sender.send(Ok(x));
+		LightClientRequest::Changes(req, sender) => match result {
+			Err(e) => send(Err(e), sender),
+			Ok(Reply::VecNumberU32(x)) => send(Ok(x), sender),
+			reply => error!("invalid reply for changes request: {:?}, {:?}", reply, req)
 		}
-		(reply, request) => error!("invalid reply for request: {:?}, {:?}", reply, request)
 	}
 }
 

@@ -117,6 +117,11 @@ impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> Behaviour<B, S, H> {
 	pub fn put_value(&mut self, key: record::Key, value: Vec<u8>) {
 		self.discovery.put_value(key, value);
 	}
+
+	/// Get unique access to the light client handler.
+	pub fn light_client_handler(&mut self) -> &mut protocol::LightClientHandler<Substream<StreamMuxerBox>, B> {
+		&mut self.light_client_handler
+	}
 }
 
 impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> NetworkBehaviourEventProcess<void::Void> for
