@@ -310,7 +310,7 @@ impl UpgradeInfo for Protocol {
     }
 }
 
-impl<T: AsyncRead> InboundUpgrade<T> for Protocol {
+impl<T: AsyncRead + AsyncWrite> InboundUpgrade<T> for Protocol {
     type Output = Request<T>;
     type Error = ReadOneError;
     type Future = ReadRespond<Negotiated<T>, (), fn(Negotiated<T>, Vec<u8>, ()) -> Result<Self::Output, Self::Error>>;

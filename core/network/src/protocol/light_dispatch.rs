@@ -676,7 +676,7 @@ pub mod tests {
 	use super::{REQUEST_TIMEOUT, LightDispatch, LightDispatchNetwork, RequestData};
 	use test_client::runtime::{changes_trie_config, Block, Extrinsic, Header};
 
-	struct DummyFetchChecker { ok: bool }
+	pub(crate) struct DummyFetchChecker { pub(crate) ok: bool }
 
 	impl FetchChecker<Block> for DummyFetchChecker {
 		fn check_header_proof(
@@ -759,7 +759,7 @@ pub mod tests {
 		});
 	}
 
-	fn dummy_header() -> Header {
+	pub(crate) fn dummy_header() -> Header {
 		Header {
 			parent_hash: Default::default(),
 			number: 0,

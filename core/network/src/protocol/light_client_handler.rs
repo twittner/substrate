@@ -876,7 +876,7 @@ impl UpgradeInfo for InboundProtocol {
     }
 }
 
-impl<T: AsyncRead> InboundUpgrade<T> for InboundProtocol {
+impl<T: AsyncRead + AsyncWrite> InboundUpgrade<T> for InboundProtocol {
     type Output = Event<T>;
     type Error = ReadOneError;
     type Future = ReadRespond<Negotiated<T>, (), fn(Negotiated<T>, Vec<u8>, ()) -> Result<Self::Output, Self::Error>>;
@@ -928,3 +928,142 @@ impl<T: AsyncRead + AsyncWrite> OutboundUpgrade<T> for OutboundProtocol {
 	}
 }
 
+#[cfg(test)]
+mod tests {
+	use client::{
+		error::Error as ClientError,
+		light::fetcher::{self, FetchChecker}
+	};
+	use crate::protocol::light_dispatch::tests::{DummyFetchChecker, dummy_header};
+	use futures::{future, prelude::*, sync::oneshot};
+	use libp2p::{
+		PeerId,
+		Multiaddr,
+		core::ConnectedPoint,
+		swarm::{NetworkBehaviour, NetworkBehaviourAction, PollParameters}
+	};
+	use sr_primitives::traits::{Block as BlockT, NumberFor, Header as HeaderT};
+	use std::{collections::HashSet, io, iter, sync::Arc, time::Instant};
+	use super::{LightClientHandler, LightClientRequest, PeerInfo, PeerStatus};
+	use test_client::runtime::{changes_trie_config, Block, Extrinsic, Header};
+
+	struct EmptyPollParams(PeerId);
+
+	impl PollParameters for EmptyPollParams {
+		type SupportedProtocolsIter = iter::Empty<Vec<u8>>;
+		type ListenedAddressesIter = iter::Empty<Multiaddr>;
+		type ExternalAddressesIter = iter::Empty<Multiaddr>;
+
+		fn supported_protocols(&self) -> Self::SupportedProtocolsIter {
+			iter::empty()
+		}
+
+		fn listened_addresses(&self) -> Self::ListenedAddressesIter {
+			iter::empty()
+		}
+
+		fn external_addresses(&self) -> Self::ExternalAddressesIter {
+			iter::empty()
+		}
+
+		fn local_peer_id(&self) -> &PeerId {
+			&self.0
+		}
+	}
+
+	fn peerset() -> (peerset::Peerset, peerset::PeersetHandle) {
+		let cfg = peerset::PeersetConfig {
+			in_peers: 128,
+			out_peers: 128,
+			bootnodes: Vec::new(),
+			reserved_only: false,
+			reserved_nodes: Vec::new()
+		};
+		peerset::Peerset::from_config(cfg)
+	}
+
+	fn make_handler
+		( ok: bool
+		, ps: peerset::PeersetHandle
+		, cf: super::Config
+		) -> LightClientHandler<io::Cursor<Vec<u8>>, Block>
+	{
+		let client = Arc::new(test_client::new());
+		let checker = Arc::new(DummyFetchChecker { ok });
+		LightClientHandler::new(cf, client, checker, ps)
+	}
+
+	fn empty_dialer() -> ConnectedPoint {
+		ConnectedPoint::Dialer { address: Multiaddr::empty() }
+	}
+
+
+	#[test]
+	fn disconnects_from_peers_if_told() {
+		let peer = PeerId::random();
+		let pset = peerset();
+		let mut handler = make_handler(true, pset.1, super::Config::default());
+
+		handler.inject_connected(peer.clone(), empty_dialer());
+		assert_eq!(1, handler.peers.len());
+
+		handler.inject_disconnected(&peer, empty_dialer());
+		assert_eq!(0, handler.peers.len())
+	}
+
+	#[test]
+	fn disconnects_if_peer_times_out() {
+		let peer0 = PeerId::random();
+		let peer1 = PeerId::random();
+		let pset = peerset();
+		let mut handler = make_handler(true, pset.1, super::Config::default());
+
+		handler.inject_connected(peer0.clone(), empty_dialer());
+		handler.inject_connected(peer1.clone(), empty_dialer());
+		assert_eq!(vec![peer0.clone(), peer1.clone()], handler.peers.keys().cloned().collect::<Vec<_>>());
+		assert!(handler.pending_requests.is_empty());
+		assert!(handler.outstanding.is_empty());
+
+		let chan = oneshot::channel();
+		let request = fetcher::RemoteCallRequest {
+			block: Default::default(),
+			header: dummy_header(),
+			method: "test".into(),
+			call_data: vec![],
+			retry_count: None,
+		};
+		handler.request(LightClientRequest::Call(request, chan.0)).unwrap();
+		assert_eq!(1, handler.pending_requests.len());
+
+		let mut params = EmptyPollParams(PeerId::random());
+		let action = future::poll_fn(move || {
+			if let Async::Ready(action) = handler.poll(&mut params) {
+				Ok::<_, ()>(Async::Ready(action))
+			} else {
+				Ok::<_, ()>(Async::NotReady)
+			}
+		})
+		.wait()
+		.expect("NetworkBehaviour::poll does not error");
+
+		if let NetworkBehaviourAction::SendEvent { peer_id, .. } = action {
+			assert!(peer_id == peer0 || peer_id == peer1)
+		} else {
+			panic!("Expected `NetworkBehaviourAction::SendEvent`")
+		}
+
+		assert!({
+			let (idle, busy): (Vec<_>, Vec<_>) = handler.peers.iter()
+					.partition(|(_, info)| info.status == PeerStatus::Idle);
+			idle.len() == 1 && busy.len() == 1
+				&& (idle[0].0 == &peer0 || busy[0].0 == &peer0)
+				&& (idle[1].0 == &peer1 || busy[1].0 == &peer1)
+		});
+
+		//light_dispatch.active_peers[&peer0].timestamp = Instant::now() - REQUEST_TIMEOUT - REQUEST_TIMEOUT;
+		//light_dispatch.maintain_peers(&mut network_interface);
+		//assert!(light_dispatch.idle_peers.is_empty());
+		//assert_eq!(vec![peer1.clone()], light_dispatch.active_peers.keys().cloned().collect::<Vec<_>>());
+		//assert_disconnected_peer(&network_interface);
+	}
+}
