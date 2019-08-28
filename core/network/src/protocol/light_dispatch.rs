@@ -39,7 +39,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Default request retry count.
 const RETRY_COUNT: usize = 1;
 /// Reputation change for a peer when a request timed out.
-const TIMEOUT_REPUTATION_CHANGE: i32 = -(1 << 8);
+pub(crate) const TIMEOUT_REPUTATION_CHANGE: i32 = -(1 << 8);
 
 /// Trait used by the `LightDispatch` service to communicate messages back to the network.
 pub trait LightDispatchNetwork<B: BlockT> {

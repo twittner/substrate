@@ -675,11 +675,14 @@ where
 	fn poll(&mut self, _: &mut impl PollParameters) -> Async<NetworkBehaviourAction<OutboundProtocol, Void>> {
 		// If we have a pending request to send, try to find an available peer and send it.
 		let now = Instant::now();
-		while let Some(request) = self.pending_requests.pop_front() {
+		while let Some(mut request) = self.pending_requests.pop_front() {
 			if now > request.timestamp + self.config.request_timeout {
-				debug!("pending request timed out");
-				send_reply(Err(ClientError::RemoteFetchFailed), request.request);
-				continue
+				if request.retries == 0 {
+					send_reply(Err(ClientError::RemoteFetchFailed), request.request);
+					continue
+				}
+				request.timestamp = Instant::now();
+				request.retries -= 1
 			}
 			let number = required_block(&request.request);
 			let available_peer = {
@@ -719,7 +722,7 @@ where
 			}
 		}
 
-		// Look for requests that have timed out.
+		// Look for ongoing requests that have timed out.
 		let mut expired = Vec::new();
 		for (id, rw) in &self.outstanding {
 			if now > rw.timestamp + self.config.request_timeout {
@@ -729,7 +732,19 @@ where
 		}
 		for id in expired {
 			if let Some(rw) = self.outstanding.remove(&id) {
-				send_reply(Err(ClientError::RemoteFetchFailed), rw.request)
+				self.remove_peer(&rw.peer);
+				self.peerset.report_peer(rw.peer.clone(), crate::protocol::light_dispatch::TIMEOUT_REPUTATION_CHANGE);
+				if rw.retries == 0 {
+					send_reply(Err(ClientError::RemoteFetchFailed), rw.request);
+					continue
+				}
+				let rw = RequestWrapper {
+					timestamp: Instant::now(),
+					retries: rw.retries - 1,
+					request: rw.request,
+					peer: ()
+				};
+				self.pending_requests.push_back(rw)
 			}
 		}
 
@@ -930,6 +945,7 @@ impl<T: AsyncRead + AsyncWrite> OutboundUpgrade<T> for OutboundProtocol {
 
 #[cfg(test)]
 mod tests {
+	use assert_matches::assert_matches;
 	use client::{
 		error::Error as ClientError,
 		light::fetcher::{self, FetchChecker}
@@ -943,9 +959,10 @@ mod tests {
 		swarm::{NetworkBehaviour, NetworkBehaviourAction, PollParameters}
 	};
 	use sr_primitives::traits::{Block as BlockT, NumberFor, Header as HeaderT};
-	use std::{collections::HashSet, io, iter, sync::Arc, time::Instant};
-	use super::{LightClientHandler, LightClientRequest, PeerInfo, PeerStatus};
+	use std::{collections::HashSet, io, iter::{self, FromIterator}, sync::Arc, time::Instant};
+	use super::{LightClientHandler, LightClientRequest, OutboundProtocol, PeerInfo, PeerStatus};
 	use test_client::runtime::{changes_trie_config, Block, Extrinsic, Header};
+	use void::Void;
 
 	struct EmptyPollParams(PeerId);
 
@@ -971,6 +988,29 @@ mod tests {
 		}
 	}
 
+	// Construct a futures `Stream` impl to aid polling in tests.
+	struct LightClientHandlerStream {
+		inner: LightClientHandler<io::Cursor<Vec<u8>>, Block>
+	}
+
+	impl LightClientHandlerStream {
+		fn next_action(&mut self) -> NetworkBehaviourAction<OutboundProtocol, Void> {
+			self.wait().next().expect("some event").expect("no error")
+		}
+	}
+
+	impl Stream for LightClientHandlerStream {
+		type Item = NetworkBehaviourAction<OutboundProtocol, Void>;
+		type Error = Void;
+
+		fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+			match self.inner.poll(&mut EmptyPollParams(PeerId::random())) {
+				Async::Ready(action) => Ok(Async::Ready(Some(action))),
+				Async::NotReady => Ok(Async::NotReady)
+			}
+		}
+	}
+
 	fn peerset() -> (peerset::Peerset, peerset::PeersetHandle) {
 		let cfg = peerset::PeersetConfig {
 			in_peers: 128,
@@ -982,15 +1022,12 @@ mod tests {
 		peerset::Peerset::from_config(cfg)
 	}
 
-	fn make_handler
-		( ok: bool
-		, ps: peerset::PeersetHandle
-		, cf: super::Config
-		) -> LightClientHandler<io::Cursor<Vec<u8>>, Block>
-	{
+	fn make_handler(ok: bool, ps: peerset::PeersetHandle, cf: super::Config) -> LightClientHandlerStream {
 		let client = Arc::new(test_client::new());
 		let checker = Arc::new(DummyFetchChecker { ok });
-		LightClientHandler::new(cf, client, checker, ps)
+		LightClientHandlerStream {
+			inner: LightClientHandler::new(cf, client, checker, ps)
+		}
 	}
 
 	fn empty_dialer() -> ConnectedPoint {
@@ -1004,11 +1041,11 @@ mod tests {
 		let pset = peerset();
 		let mut handler = make_handler(true, pset.1, super::Config::default());
 
-		handler.inject_connected(peer.clone(), empty_dialer());
-		assert_eq!(1, handler.peers.len());
+		handler.inner.inject_connected(peer.clone(), empty_dialer());
+		assert_eq!(1, handler.inner.peers.len());
 
-		handler.inject_disconnected(&peer, empty_dialer());
-		assert_eq!(0, handler.peers.len())
+		handler.inner.inject_disconnected(&peer, empty_dialer());
+		assert_eq!(0, handler.inner.peers.len())
 	}
 
 	#[test]
@@ -1018,52 +1055,63 @@ mod tests {
 		let pset = peerset();
 		let mut handler = make_handler(true, pset.1, super::Config::default());
 
-		handler.inject_connected(peer0.clone(), empty_dialer());
-		handler.inject_connected(peer1.clone(), empty_dialer());
-		assert_eq!(vec![peer0.clone(), peer1.clone()], handler.peers.keys().cloned().collect::<Vec<_>>());
-		assert!(handler.pending_requests.is_empty());
-		assert!(handler.outstanding.is_empty());
+		handler.inner.inject_connected(peer0.clone(), empty_dialer());
+		handler.inner.inject_connected(peer1.clone(), empty_dialer());
 
+		// We now know about two peers.
+		assert_eq!
+			( HashSet::from_iter(&[peer0.clone(), peer1.clone()])
+			, handler.inner.peers.keys().collect::<HashSet<_>>()
+			);
+
+		// No requests have been made yet.
+		assert!(handler.inner.pending_requests.is_empty());
+		assert!(handler.inner.outstanding.is_empty());
+
+		// Issue our first request!
 		let chan = oneshot::channel();
 		let request = fetcher::RemoteCallRequest {
 			block: Default::default(),
 			header: dummy_header(),
 			method: "test".into(),
 			call_data: vec![],
-			retry_count: None,
+			retry_count: Some(1),
 		};
-		handler.request(LightClientRequest::Call(request, chan.0)).unwrap();
-		assert_eq!(1, handler.pending_requests.len());
+		handler.inner.request(LightClientRequest::Call(request, chan.0)).unwrap();
+		assert_eq!(1, handler.inner.pending_requests.len());
 
-		let mut params = EmptyPollParams(PeerId::random());
-		let action = future::poll_fn(move || {
-			if let Async::Ready(action) = handler.poll(&mut params) {
-				Ok::<_, ()>(Async::Ready(action))
-			} else {
-				Ok::<_, ()>(Async::NotReady)
-			}
-		})
-		.wait()
-		.expect("NetworkBehaviour::poll does not error");
-
-		if let NetworkBehaviourAction::SendEvent { peer_id, .. } = action {
+		// The behaviour should now attempt to send the request.
+		assert_matches!(handler.next_action(), NetworkBehaviourAction::SendEvent { peer_id, .. } => {
 			assert!(peer_id == peer0 || peer_id == peer1)
-		} else {
-			panic!("Expected `NetworkBehaviourAction::SendEvent`")
-		}
-
-		assert!({
-			let (idle, busy): (Vec<_>, Vec<_>) = handler.peers.iter()
-					.partition(|(_, info)| info.status == PeerStatus::Idle);
-			idle.len() == 1 && busy.len() == 1
-				&& (idle[0].0 == &peer0 || busy[0].0 == &peer0)
-				&& (idle[1].0 == &peer1 || busy[1].0 == &peer1)
 		});
 
-		//light_dispatch.active_peers[&peer0].timestamp = Instant::now() - REQUEST_TIMEOUT - REQUEST_TIMEOUT;
-		//light_dispatch.maintain_peers(&mut network_interface);
-		//assert!(light_dispatch.idle_peers.is_empty());
-		//assert_eq!(vec![peer1.clone()], light_dispatch.active_peers.keys().cloned().collect::<Vec<_>>());
-		//assert_disconnected_peer(&network_interface);
+		// And we should now have one busy peer.
+		assert!({
+			let (idle, busy): (Vec<_>, Vec<_>) =
+				handler.inner.peers.iter()
+					.partition(|(_, info)| info.status == PeerStatus::Idle);
+
+			idle.len() == 1 && busy.len() == 1
+				&& (idle[0].0 == &peer0 || busy[0].0 == &peer0)
+				&& (idle[0].0 == &peer1 || busy[0].0 == &peer1)
+		});
+
+		// No more pending requests, but one should be outstanding.
+		assert!(handler.inner.pending_requests.is_empty());
+		assert_eq!(1, handler.inner.outstanding.len());
+
+		// We now set back the timetamp of the outstanding request to make it expire.
+		let request = handler.inner.outstanding.values_mut().next().unwrap();
+		request.timestamp -= super::Config::default().request_timeout;
+
+		// Make progress, but do not expect some action.
+		assert_matches!(handler.poll(), Ok(Async::NotReady));
+
+		// The request should have timed out by now and the corresponding peer be removed.
+		assert_eq!(1, handler.inner.peers.len());
+		// Since we asked for one retry, the request should be back in the pending queue.
+		assert_eq!(1, handler.inner.pending_requests.len());
+		// No other request should be ongoing.
+		assert!(handler.inner.outstanding.is_empty());
 	}
 }
