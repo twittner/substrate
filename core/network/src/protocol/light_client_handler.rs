@@ -946,6 +946,7 @@ impl<T: AsyncRead + AsyncWrite> OutboundUpgrade<T> for OutboundProtocol {
 #[cfg(test)]
 mod tests {
 	use assert_matches::assert_matches;
+	use bytes::Bytes;
 	use client::{
 		error::Error as ClientError,
 		light::fetcher::{self, FetchChecker}
@@ -955,14 +956,54 @@ mod tests {
 	use libp2p::{
 		PeerId,
 		Multiaddr,
-		core::ConnectedPoint,
-		swarm::{NetworkBehaviour, NetworkBehaviourAction, PollParameters}
+		Transport,
+		core::{
+			ConnectedPoint,
+			identity,
+			muxing::{StreamMuxerBox, SubstreamRef},
+			transport::{
+				self,
+				boxed::Boxed,
+				memory::{MemoryTransport, MemoryTransportError, Channel}
+			},
+			upgrade
+		},
+		noise::{self, Keypair, X25519, NoiseConfig},
+		swarm::{NetworkBehaviour, NetworkBehaviourAction, PollParameters, Swarm},
+		yamux
 	};
 	use sr_primitives::traits::{Block as BlockT, NumberFor, Header as HeaderT};
 	use std::{collections::HashSet, io, iter::{self, FromIterator}, sync::Arc, time::Instant};
 	use super::{LightClientHandler, LightClientRequest, OutboundProtocol, PeerInfo, PeerStatus};
 	use test_client::runtime::{changes_trie_config, Block, Extrinsic, Header};
 	use void::Void;
+
+	fn make_swarm
+		( ok: bool
+		, ps: peerset::PeersetHandle
+		, cf: super::Config
+		) -> Swarm<Boxed<(PeerId, StreamMuxerBox), io::Error>, LightClientHandler<SubstreamRef<Arc<StreamMuxerBox>>, Block>>
+	{
+		let id_key = identity::Keypair::generate_ed25519();
+		let dh_key = Keypair::<X25519>::new().into_authentic(&id_key).unwrap();
+		let local_peer = id_key.public().into_peer_id();
+		let transport = MemoryTransport::default()
+			.with_upgrade(NoiseConfig::xx(dh_key))
+			.and_then(move |(remote, stream), endpoint| {
+				let peer =
+					if let noise::RemoteIdentity::IdentityKey(k) = remote {
+						k.into_peer_id()
+					} else {
+						panic!("Expected IdentityKey")
+					};
+				upgrade::apply(stream, yamux::Config::default(), endpoint).map(|m| (peer, StreamMuxerBox::new(m)))
+			})
+			.map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+			.boxed();
+		let client = Arc::new(test_client::new());
+		let checker = Arc::new(DummyFetchChecker { ok });
+		Swarm::new(transport, LightClientHandler::new(cf, client, checker, ps), local_peer)
+	}
 
 	struct EmptyPollParams(PeerId);
 
@@ -1039,13 +1080,13 @@ mod tests {
 	fn disconnects_from_peers_if_told() {
 		let peer = PeerId::random();
 		let pset = peerset();
-		let mut handler = make_handler(true, pset.1, super::Config::default());
+		let mut swarm = make_swarm(true, pset.1, super::Config::default());
 
-		handler.inner.inject_connected(peer.clone(), empty_dialer());
-		assert_eq!(1, handler.inner.peers.len());
+		swarm.inject_connected(peer.clone(), empty_dialer());
+		assert_eq!(1, swarm.peers.len());
 
-		handler.inner.inject_disconnected(&peer, empty_dialer());
-		assert_eq!(0, handler.inner.peers.len())
+		swarm.inject_disconnected(&peer, empty_dialer());
+		assert_eq!(0, swarm.peers.len())
 	}
 
 	#[test]
