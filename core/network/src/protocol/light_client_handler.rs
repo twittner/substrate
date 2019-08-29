@@ -946,63 +946,20 @@ impl<T: AsyncRead + AsyncWrite> OutboundUpgrade<T> for OutboundProtocol {
 #[cfg(test)]
 mod tests {
 	use assert_matches::assert_matches;
-	use bytes::Bytes;
-	use client::{
-		error::Error as ClientError,
-		light::fetcher::{self, FetchChecker}
-	};
-	use crate::protocol::light_dispatch::tests::{DummyFetchChecker, dummy_header};
-	use futures::{future, prelude::*, sync::oneshot};
+	use client::{error::Error as ClientError, light::fetcher};
+	use codec::Encode;
+	use crate::protocol::{api, light_dispatch::tests::{DummyFetchChecker, dummy_header}};
+	use futures::{prelude::*, sync::oneshot};
 	use libp2p::{
 		PeerId,
 		Multiaddr,
-		Transport,
-		core::{
-			ConnectedPoint,
-			identity,
-			muxing::{StreamMuxerBox, SubstreamRef},
-			transport::{
-				self,
-				boxed::Boxed,
-				memory::{MemoryTransport, MemoryTransportError, Channel}
-			},
-			upgrade
-		},
-		noise::{self, Keypair, X25519, NoiseConfig},
+		core::ConnectedPoint,
 		swarm::{NetworkBehaviour, NetworkBehaviourAction, PollParameters},
-		yamux
 	};
-	use sr_primitives::traits::{Block as BlockT, NumberFor, Header as HeaderT};
-	use std::{collections::HashSet, io, iter::{self, FromIterator}, sync::Arc, time::Instant};
-	use super::{LightClientHandler, LightClientRequest, OutboundProtocol, PeerInfo, PeerStatus};
-	use test_client::runtime::{changes_trie_config, Block, Extrinsic, Header};
+	use std::{collections::HashSet, io, iter::{self, FromIterator}, sync::Arc};
+	use super::{Event, LightClientHandler, LightClientRequest, OutboundProtocol, PeerStatus};
+	use test_client::runtime::{changes_trie_config, Block};
 	use void::Void;
-
-	type Handler = LightClientHandler<SubstreamRef<Arc<StreamMuxerBox>>, Block>;
-	type Swarm = libp2p::swarm::Swarm<Boxed<(PeerId, StreamMuxerBox), io::Error>, Handler>;
-
-	fn make_swarm(ok: bool, ps: peerset::PeersetHandle, cf: super::Config) -> SwarmWrapper {
-		let id_key = identity::Keypair::generate_ed25519();
-		let dh_key = Keypair::<X25519>::new().into_authentic(&id_key).unwrap();
-		let local_peer = id_key.public().into_peer_id();
-		let transport = MemoryTransport::default()
-			.with_upgrade(NoiseConfig::xx(dh_key))
-			.and_then(move |(remote, stream), endpoint| {
-				let peer =
-					if let noise::RemoteIdentity::IdentityKey(k) = remote {
-						k.into_peer_id()
-					} else {
-						panic!("Expected IdentityKey")
-					};
-				upgrade::apply(stream, yamux::Config::default(), endpoint).map(|m| (peer, StreamMuxerBox::new(m)))
-			})
-			.map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-			.boxed();
-		let client = Arc::new(test_client::new());
-		let checker = Arc::new(DummyFetchChecker { ok });
-		let swarm = libp2p::swarm::Swarm::new(transport, LightClientHandler::new(cf, client, checker, ps), local_peer);
-		SwarmWrapper(swarm)
-	}
 
 	struct EmptyPollParams(PeerId);
 
@@ -1028,42 +985,6 @@ mod tests {
 		}
 	}
 
-	// We wrap the `Swarm` here to allow polling its behaviour instead of the swarm itself.
-	struct SwarmWrapper(Swarm);
-
-	impl SwarmWrapper {
-		fn next_behaviour_action(&mut self) -> NetworkBehaviourAction<OutboundProtocol, Void> {
-			self.wait().next().expect("some event").expect("no error")
-		}
-	}
-
-	impl std::ops::Deref for SwarmWrapper {
-		type Target = Swarm;
-
-		fn deref(&self) -> &Self::Target {
-			&self.0
-		}
-	}
-
-	impl std::ops::DerefMut for SwarmWrapper {
-		fn deref_mut(&mut self) -> &mut Self::Target {
-			&mut self.0
-		}
-	}
-
-	impl Stream for SwarmWrapper {
-		type Item = NetworkBehaviourAction<OutboundProtocol, Void>;
-		type Error = Void;
-
-		fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-			let peer_id = libp2p::swarm::Swarm::local_peer_id(&self.0).clone();
-			match NetworkBehaviour::poll(&mut *self.0, &mut EmptyPollParams(peer_id)) {
-				Async::Ready(action) => Ok(Async::Ready(Some(action))),
-				Async::NotReady => Ok(Async::NotReady)
-			}
-		}
-	}
-
 	fn peerset() -> (peerset::Peerset, peerset::PeersetHandle) {
 		let cfg = peerset::PeersetConfig {
 			in_peers: 128,
@@ -1075,21 +996,39 @@ mod tests {
 		peerset::Peerset::from_config(cfg)
 	}
 
+	fn make_behaviour
+		( ok: bool
+		, ps: peerset::PeersetHandle
+		, cf: super::Config
+		) -> LightClientHandler<io::Cursor<Vec<u8>>, Block>
+	{
+		let client = Arc::new(test_client::new());
+		let checker = Arc::new(DummyFetchChecker { ok });
+		LightClientHandler::new(cf, client, checker, ps)
+	}
+
 	fn empty_dialer() -> ConnectedPoint {
 		ConnectedPoint::Dialer { address: Multiaddr::empty() }
+	}
+
+	fn poll
+		( b: &mut LightClientHandler<io::Cursor<Vec<u8>>, Block>
+		) -> Async<NetworkBehaviourAction<OutboundProtocol, Void>>
+	{
+		b.poll(&mut EmptyPollParams(PeerId::random()))
 	}
 
 	#[test]
 	fn disconnects_from_peer_if_told() {
 		let peer = PeerId::random();
 		let pset = peerset();
-		let mut swarm = make_swarm(true, pset.1, super::Config::default());
+		let mut behaviour = make_behaviour(true, pset.1, super::Config::default());
 
-		swarm.inject_connected(peer.clone(), empty_dialer());
-		assert_eq!(1, swarm.peers.len());
+		behaviour.inject_connected(peer.clone(), empty_dialer());
+		assert_eq!(1, behaviour.peers.len());
 
-		swarm.inject_disconnected(&peer, empty_dialer());
-		assert_eq!(0, swarm.peers.len())
+		behaviour.inject_disconnected(&peer, empty_dialer());
+		assert_eq!(0, behaviour.peers.len())
 	}
 
 	#[test]
@@ -1097,17 +1036,17 @@ mod tests {
 		let peer0 = PeerId::random();
 		let peer1 = PeerId::random();
 		let pset = peerset();
-		let mut swarm = make_swarm(true, pset.1, super::Config::default());
+		let mut behaviour = make_behaviour(true, pset.1, super::Config::default());
 
-		swarm.inject_connected(peer0.clone(), empty_dialer());
-		swarm.inject_connected(peer1.clone(), empty_dialer());
+		behaviour.inject_connected(peer0.clone(), empty_dialer());
+		behaviour.inject_connected(peer1.clone(), empty_dialer());
 
 		// We now know about two peers.
-		assert_eq!(HashSet::from_iter(&[peer0.clone(), peer1.clone()]), swarm.peers.keys().collect::<HashSet<_>>());
+		assert_eq!(HashSet::from_iter(&[peer0.clone(), peer1.clone()]), behaviour.peers.keys().collect::<HashSet<_>>());
 
 		// No requests have been made yet.
-		assert!(swarm.pending_requests.is_empty());
-		assert!(swarm.outstanding.is_empty());
+		assert!(behaviour.pending_requests.is_empty());
+		assert!(behaviour.outstanding.is_empty());
 
 		// Issue our first request!
 		let chan = oneshot::channel();
@@ -1118,18 +1057,18 @@ mod tests {
 			call_data: vec![],
 			retry_count: Some(1),
 		};
-		swarm.request(LightClientRequest::Call(request, chan.0)).unwrap();
-		assert_eq!(1, swarm.pending_requests.len());
+		behaviour.request(LightClientRequest::Call(request, chan.0)).unwrap();
+		assert_eq!(1, behaviour.pending_requests.len());
 
 		// The behaviour should now attempt to send the request.
-		assert_matches!(swarm.next_behaviour_action(), NetworkBehaviourAction::SendEvent { peer_id, .. } => {
+		assert_matches!(poll(&mut behaviour), Async::Ready(NetworkBehaviourAction::SendEvent { peer_id, .. }) => {
 			assert!(peer_id == peer0 || peer_id == peer1)
 		});
 
 		// And we should have one busy peer.
 		assert!({
 			let (idle, busy): (Vec<_>, Vec<_>) =
-				swarm.peers.iter().partition(|(_, info)| info.status == PeerStatus::Idle);
+				behaviour.peers.iter().partition(|(_, info)| info.status == PeerStatus::Idle);
 
 			idle.len() == 1 && busy.len() == 1
 				&& (idle[0].0 == &peer0 || busy[0].0 == &peer0)
@@ -1137,28 +1076,389 @@ mod tests {
 		});
 
 		// No more pending requests, but one should be outstanding.
-		assert!(swarm.pending_requests.is_empty());
-		assert_eq!(1, swarm.outstanding.len());
+		assert_eq!(0, behaviour.pending_requests.len());
+		assert_eq!(1, behaviour.outstanding.len());
 
 		// We now set back the timestamp of the outstanding request to make it expire.
-		let request = swarm.outstanding.values_mut().next().unwrap();
+		let request = behaviour.outstanding.values_mut().next().unwrap();
 		request.timestamp -= super::Config::default().request_timeout;
 
 		// Make progress, but do not expect some action.
-		assert_matches!(swarm.poll(), Ok(Async::NotReady));
+		assert_matches!(poll(&mut behaviour), Async::NotReady);
 
 		// The request should have timed out by now and the corresponding peer be removed.
-		assert_eq!(1, swarm.peers.len());
+		assert_eq!(1, behaviour.peers.len());
 		// Since we asked for one retry, the request should be back in the pending queue.
-		assert_eq!(1, swarm.pending_requests.len());
+		assert_eq!(1, behaviour.pending_requests.len());
 		// No other request should be ongoing.
-		assert!(swarm.outstanding.is_empty());
+		assert_eq!(0, behaviour.outstanding.len());
 	}
 
 	#[test]
 	fn disconnects_from_peer_on_response_with_wrong_id() {
 		let peer = PeerId::random();
 		let pset = peerset();
-		let mut swarm = make_swarm(true, pset.1, super::Config::default());
+		let mut behaviour = make_behaviour(true, pset.1, super::Config::default());
+
+		behaviour.inject_connected(peer.clone(), empty_dialer());
+		assert_eq!(1, behaviour.peers.len());
+
+		let chan = oneshot::channel();
+		let request = fetcher::RemoteCallRequest {
+			block: Default::default(),
+			header: dummy_header(),
+			method: "test".into(),
+			call_data: vec![],
+			retry_count: Some(1),
+		};
+		behaviour.request(LightClientRequest::Call(request, chan.0)).unwrap();
+
+		assert_eq!(1, behaviour.pending_requests.len());
+		assert_eq!(0, behaviour.outstanding.len());
+		poll(&mut behaviour); // Make progress
+		assert_eq!(0, behaviour.pending_requests.len());
+		assert_eq!(1, behaviour.outstanding.len());
+
+		// Construct response with bogus ID
+		let response = {
+			let r = api::v1::light::RemoteCallResponse { proof: Vec::new() };
+			api::v1::light::Response {
+				id: 2365789,
+				response: Some(api::v1::light::response::Response::RemoteCallResponse(r))
+			}
+		};
+
+		// Make sure our bogus ID is really not used.
+		assert!(!behaviour.outstanding.keys().any(|id| id == &response.id));
+
+		behaviour.inject_node_event(peer.clone(), Event::Response(response));
+		assert!(behaviour.peers.is_empty());
+
+		poll(&mut behaviour); // More progress
+
+		// The request should be back in the pending queue
+		assert_eq!(1, behaviour.pending_requests.len());
+		assert_eq!(0, behaviour.outstanding.len());
+	}
+
+	#[test]
+	fn disconnects_from_peer_on_incorrect_response() {
+		let peer = PeerId::random();
+		let pset = peerset();
+		let mut behaviour = make_behaviour(false, pset.1, super::Config::default());
+		//                                 ^--- Making sure the response data check fails.
+
+		behaviour.inject_connected(peer.clone(), empty_dialer());
+		assert_eq!(1, behaviour.peers.len());
+
+		let chan = oneshot::channel();
+		let request = fetcher::RemoteCallRequest {
+			block: Default::default(),
+			header: dummy_header(),
+			method: "test".into(),
+			call_data: vec![],
+			retry_count: Some(1),
+		};
+		behaviour.request(LightClientRequest::Call(request, chan.0)).unwrap();
+
+		assert_eq!(1, behaviour.pending_requests.len());
+		assert_eq!(0, behaviour.outstanding.len());
+		poll(&mut behaviour); // Make progress
+		assert_eq!(0, behaviour.pending_requests.len());
+		assert_eq!(1, behaviour.outstanding.len());
+
+		let request_id = *behaviour.outstanding.keys().next().unwrap();
+
+		let response = {
+			let r = api::v1::light::RemoteCallResponse { proof: Vec::new() };
+			api::v1::light::Response {
+				id: request_id,
+				response: Some(api::v1::light::response::Response::RemoteCallResponse(r))
+			}
+		};
+
+		behaviour.inject_node_event(peer.clone(), Event::Response(response));
+		assert!(behaviour.peers.is_empty());
+
+		poll(&mut behaviour); // More progress
+
+		// The request should be back in the pending queue
+		assert_eq!(1, behaviour.pending_requests.len());
+		assert_eq!(0, behaviour.outstanding.len());
+	}
+
+	#[test]
+	fn disconnects_from_peer_on_unexpected_response() {
+		let peer = PeerId::random();
+		let pset = peerset();
+		let mut behaviour = make_behaviour(true, pset.1, super::Config::default());
+
+		behaviour.inject_connected(peer.clone(), empty_dialer());
+		assert_eq!(1, behaviour.peers.len());
+		assert_eq!(0, behaviour.pending_requests.len());
+		assert_eq!(0, behaviour.outstanding.len());
+
+		// Some unsolicited response
+		let response = {
+			let r = api::v1::light::RemoteCallResponse { proof: Vec::new() };
+			api::v1::light::Response {
+				id: 2347895932,
+				response: Some(api::v1::light::response::Response::RemoteCallResponse(r))
+			}
+		};
+
+		behaviour.inject_node_event(peer.clone(), Event::Response(response));
+
+		assert!(behaviour.peers.is_empty());
+		poll(&mut behaviour);
+		assert_eq!(0, behaviour.pending_requests.len());
+		assert_eq!(0, behaviour.outstanding.len());
+	}
+
+	#[test]
+	fn disconnects_from_peer_on_wrong_response_type() {
+		let peer = PeerId::random();
+		let pset = peerset();
+		let mut behaviour = make_behaviour(true, pset.1, super::Config::default());
+
+		behaviour.inject_connected(peer.clone(), empty_dialer());
+		assert_eq!(1, behaviour.peers.len());
+
+		let chan = oneshot::channel();
+		let request = fetcher::RemoteCallRequest {
+			block: Default::default(),
+			header: dummy_header(),
+			method: "test".into(),
+			call_data: vec![],
+			retry_count: Some(1),
+		};
+		behaviour.request(LightClientRequest::Call(request, chan.0)).unwrap();
+
+		assert_eq!(1, behaviour.pending_requests.len());
+		assert_eq!(0, behaviour.outstanding.len());
+		poll(&mut behaviour); // Make progress
+		assert_eq!(0, behaviour.pending_requests.len());
+		assert_eq!(1, behaviour.outstanding.len());
+
+		let request_id = *behaviour.outstanding.keys().next().unwrap();
+
+		let response = {
+			let r = api::v1::light::RemoteReadResponse { proof: Vec::new() }; // Not a RemoteCallResponse!
+			api::v1::light::Response {
+				id: request_id,
+				response: Some(api::v1::light::response::Response::RemoteReadResponse(r))
+			}
+		};
+
+		behaviour.inject_node_event(peer.clone(), Event::Response(response));
+		assert!(behaviour.peers.is_empty());
+
+		poll(&mut behaviour); // More progress
+
+		// The request should be back in the pending queue
+		assert_eq!(1, behaviour.pending_requests.len());
+		assert_eq!(0, behaviour.outstanding.len());
+	}
+
+	#[test]
+	fn receives_remote_failure_after_retry_count_failures() {
+		let peer1 = PeerId::random();
+		let peer2 = PeerId::random();
+		let peer3 = PeerId::random();
+		let peer4 = PeerId::random();
+		let pset = peerset();
+		let mut behaviour = make_behaviour(false, pset.1, super::Config::default());
+		//                                 ^--- Making sure the response data check fails.
+
+		behaviour.inject_connected(peer1.clone(), empty_dialer());
+		behaviour.inject_connected(peer2.clone(), empty_dialer());
+		behaviour.inject_connected(peer3.clone(), empty_dialer());
+		behaviour.inject_connected(peer4.clone(), empty_dialer());
+		assert_eq!(4, behaviour.peers.len());
+
+		let mut chan = oneshot::channel();
+		let request = fetcher::RemoteCallRequest {
+			block: Default::default(),
+			header: dummy_header(),
+			method: "test".into(),
+			call_data: vec![],
+			retry_count: Some(3), // Attempt up to three retries.
+		};
+		behaviour.request(LightClientRequest::Call(request, chan.0)).unwrap();
+
+		assert_eq!(1, behaviour.pending_requests.len());
+		assert_eq!(0, behaviour.outstanding.len());
+		assert_matches!(poll(&mut behaviour), Async::Ready(NetworkBehaviourAction::SendEvent { .. }));
+		assert_eq!(0, behaviour.pending_requests.len());
+		assert_eq!(1, behaviour.outstanding.len());
+
+		for _ in 0 .. 3 {
+			// Construct an invalid response
+			let request_id = *behaviour.outstanding.keys().next().unwrap();
+			let responding_peer = behaviour.outstanding.values().next().unwrap().peer.clone();
+			let response = {
+				let r = api::v1::light::RemoteCallResponse { proof: Vec::new() };
+				api::v1::light::Response {
+					id: request_id,
+					response: Some(api::v1::light::response::Response::RemoteCallResponse(r))
+				}
+			};
+			behaviour.inject_node_event(responding_peer, Event::Response(response.clone()));
+			assert_matches!(poll(&mut behaviour), Async::Ready(NetworkBehaviourAction::SendEvent { .. }));
+			assert_matches!(chan.1.try_recv(), Ok(None))
+		}
+		// Final invalid response
+		let request_id = *behaviour.outstanding.keys().next().unwrap();
+		let responding_peer = behaviour.outstanding.values().next().unwrap().peer.clone();
+		let response = {
+			let r = api::v1::light::RemoteCallResponse { proof: Vec::new() };
+			api::v1::light::Response {
+				id: request_id,
+				response: Some(api::v1::light::response::Response::RemoteCallResponse(r))
+			}
+		};
+		behaviour.inject_node_event(responding_peer, Event::Response(response));
+		assert_matches!(poll(&mut behaviour), Async::NotReady);
+		assert_matches!(chan.1.try_recv(), Ok(Some(Err(ClientError::RemoteFetchFailed))))
+	}
+
+	fn issue_request(request: LightClientRequest<Block>) {
+		let peer = PeerId::random();
+		let pset = peerset();
+		let mut behaviour = make_behaviour(true, pset.1, super::Config::default());
+
+		behaviour.inject_connected(peer.clone(), empty_dialer());
+		assert_eq!(1, behaviour.peers.len());
+
+		let response = match request {
+			LightClientRequest::Header(..) => {
+				let r = api::v1::light::RemoteHeaderResponse {
+					header: dummy_header().encode(),
+					proof: Vec::new()
+				};
+				api::v1::light::Response {
+					id: 1,
+					response: Some(api::v1::light::response::Response::RemoteHeaderResponse(r))
+				}
+			}
+			LightClientRequest::Read(..) => {
+				let r = api::v1::light::RemoteReadResponse { proof: Vec::new() };
+				api::v1::light::Response {
+					id: 1,
+					response: Some(api::v1::light::response::Response::RemoteReadResponse(r))
+				}
+			}
+			LightClientRequest::ReadChild(..) => {
+				let r = api::v1::light::RemoteReadResponse { proof: Vec::new() };
+				api::v1::light::Response {
+					id: 1,
+					response: Some(api::v1::light::response::Response::RemoteReadResponse(r))
+				}
+			}
+			LightClientRequest::Call(..) => {
+				let r = api::v1::light::RemoteCallResponse { proof: Vec::new() };
+				api::v1::light::Response {
+					id: 1,
+					response: Some(api::v1::light::response::Response::RemoteCallResponse(r))
+				}
+			}
+			LightClientRequest::Changes(..) => {
+				let r = api::v1::light::RemoteChangesResponse {
+					max: iter::repeat(1).take(32).collect(),
+					proof: Vec::new(),
+					roots: Vec::new(),
+					roots_proof: Vec::new()
+				};
+				api::v1::light::Response {
+					id: 1,
+					response: Some(api::v1::light::response::Response::RemoteChangesResponse(r))
+				}
+			}
+		};
+
+		behaviour.request(request).unwrap();
+
+		assert_eq!(1, behaviour.pending_requests.len());
+		assert_eq!(0, behaviour.outstanding.len());
+		assert_matches!(poll(&mut behaviour), Async::Ready(NetworkBehaviourAction::SendEvent { .. }));
+		assert_eq!(0, behaviour.pending_requests.len());
+		assert_eq!(1, behaviour.outstanding.len());
+		assert_eq!(1, *behaviour.outstanding.keys().next().unwrap());
+
+		behaviour.inject_node_event(peer.clone(), Event::Response(response));
+
+		poll(&mut behaviour);
+
+		assert_eq!(0, behaviour.pending_requests.len());
+		assert_eq!(0, behaviour.outstanding.len())
+	}
+
+	#[test]
+	fn receives_remote_call_response() {
+		let mut chan = oneshot::channel();
+		let request = fetcher::RemoteCallRequest {
+			block: Default::default(),
+			header: dummy_header(),
+			method: "test".into(),
+			call_data: vec![],
+			retry_count: None
+		};
+		issue_request(LightClientRequest::Call(request, chan.0));
+		assert_matches!(chan.1.try_recv(), Ok(Some(Ok(_))))
+	}
+
+	#[test]
+	fn receives_remote_read_response() {
+		let mut chan = oneshot::channel();
+		let request = fetcher::RemoteReadRequest {
+			header: dummy_header(),
+			block: Default::default(),
+			key: b":key".to_vec(),
+			retry_count: None
+		};
+		issue_request(LightClientRequest::Read(request, chan.0));
+		assert_matches!(chan.1.try_recv(), Ok(Some(Ok(_))))
+	}
+
+	#[test]
+	fn receives_remote_read_child_response() {
+		let mut chan = oneshot::channel();
+		let request = fetcher::RemoteReadChildRequest {
+			header: dummy_header(),
+			block: Default::default(),
+			storage_key: b":child_storage:sub".to_vec(),
+			key: b":key".to_vec(),
+			retry_count: None
+		};
+		issue_request(LightClientRequest::ReadChild(request, chan.0));
+		assert_matches!(chan.1.try_recv(), Ok(Some(Ok(_))))
+	}
+
+	#[test]
+	fn receives_remote_header_response() {
+		let mut chan = oneshot::channel();
+		let request = fetcher::RemoteHeaderRequest {
+			cht_root: Default::default(),
+			block: 1,
+			retry_count: None
+		};
+		issue_request(LightClientRequest::Header(request, chan.0));
+		assert_matches!(chan.1.try_recv(), Ok(Some(Ok(_))))
+	}
+
+	#[test]
+	fn receives_remote_changes_response() {
+		let mut chan = oneshot::channel();
+		let request = fetcher::RemoteChangesRequest {
+			changes_trie_config: changes_trie_config(),
+			first_block: (1, Default::default()),
+			last_block: (100, Default::default()),
+			max_block: (100, Default::default()),
+			tries_roots: (1, Default::default(), Vec::new()),
+			key: Vec::new(),
+			retry_count: None
+		};
+		issue_request(LightClientRequest::Changes(request, chan.0));
+		assert_matches!(chan.1.try_recv(), Ok(Some(Ok(_))))
 	}
 }
