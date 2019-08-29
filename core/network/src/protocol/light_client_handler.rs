@@ -969,7 +969,7 @@ mod tests {
 			upgrade
 		},
 		noise::{self, Keypair, X25519, NoiseConfig},
-		swarm::{NetworkBehaviour, NetworkBehaviourAction, PollParameters, Swarm},
+		swarm::{NetworkBehaviour, NetworkBehaviourAction, PollParameters},
 		yamux
 	};
 	use sr_primitives::traits::{Block as BlockT, NumberFor, Header as HeaderT};
@@ -978,12 +978,10 @@ mod tests {
 	use test_client::runtime::{changes_trie_config, Block, Extrinsic, Header};
 	use void::Void;
 
-	fn make_swarm
-		( ok: bool
-		, ps: peerset::PeersetHandle
-		, cf: super::Config
-		) -> Swarm<Boxed<(PeerId, StreamMuxerBox), io::Error>, LightClientHandler<SubstreamRef<Arc<StreamMuxerBox>>, Block>>
-	{
+	type Handler = LightClientHandler<SubstreamRef<Arc<StreamMuxerBox>>, Block>;
+	type Swarm = libp2p::swarm::Swarm<Boxed<(PeerId, StreamMuxerBox), io::Error>, Handler>;
+
+	fn make_swarm(ok: bool, ps: peerset::PeersetHandle, cf: super::Config) -> SwarmWrapper {
 		let id_key = identity::Keypair::generate_ed25519();
 		let dh_key = Keypair::<X25519>::new().into_authentic(&id_key).unwrap();
 		let local_peer = id_key.public().into_peer_id();
@@ -1002,7 +1000,8 @@ mod tests {
 			.boxed();
 		let client = Arc::new(test_client::new());
 		let checker = Arc::new(DummyFetchChecker { ok });
-		Swarm::new(transport, LightClientHandler::new(cf, client, checker, ps), local_peer)
+		let swarm = libp2p::swarm::Swarm::new(transport, LightClientHandler::new(cf, client, checker, ps), local_peer);
+		SwarmWrapper(swarm)
 	}
 
 	struct EmptyPollParams(PeerId);
@@ -1029,23 +1028,36 @@ mod tests {
 		}
 	}
 
-	// Construct a futures `Stream` impl to aid polling in tests.
-	struct LightClientHandlerStream {
-		inner: LightClientHandler<io::Cursor<Vec<u8>>, Block>
-	}
+	// We wrap the `Swarm` here to allow polling its behaviour instead of the swarm itself.
+	struct SwarmWrapper(Swarm);
 
-	impl LightClientHandlerStream {
-		fn next_action(&mut self) -> NetworkBehaviourAction<OutboundProtocol, Void> {
+	impl SwarmWrapper {
+		fn next_behaviour_action(&mut self) -> NetworkBehaviourAction<OutboundProtocol, Void> {
 			self.wait().next().expect("some event").expect("no error")
 		}
 	}
 
-	impl Stream for LightClientHandlerStream {
+	impl std::ops::Deref for SwarmWrapper {
+		type Target = Swarm;
+
+		fn deref(&self) -> &Self::Target {
+			&self.0
+		}
+	}
+
+	impl std::ops::DerefMut for SwarmWrapper {
+		fn deref_mut(&mut self) -> &mut Self::Target {
+			&mut self.0
+		}
+	}
+
+	impl Stream for SwarmWrapper {
 		type Item = NetworkBehaviourAction<OutboundProtocol, Void>;
 		type Error = Void;
 
 		fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-			match self.inner.poll(&mut EmptyPollParams(PeerId::random())) {
+			let peer_id = libp2p::swarm::Swarm::local_peer_id(&self.0).clone();
+			match NetworkBehaviour::poll(&mut *self.0, &mut EmptyPollParams(peer_id)) {
 				Async::Ready(action) => Ok(Async::Ready(Some(action))),
 				Async::NotReady => Ok(Async::NotReady)
 			}
@@ -1063,21 +1075,12 @@ mod tests {
 		peerset::Peerset::from_config(cfg)
 	}
 
-	fn make_handler(ok: bool, ps: peerset::PeersetHandle, cf: super::Config) -> LightClientHandlerStream {
-		let client = Arc::new(test_client::new());
-		let checker = Arc::new(DummyFetchChecker { ok });
-		LightClientHandlerStream {
-			inner: LightClientHandler::new(cf, client, checker, ps)
-		}
-	}
-
 	fn empty_dialer() -> ConnectedPoint {
 		ConnectedPoint::Dialer { address: Multiaddr::empty() }
 	}
 
-
 	#[test]
-	fn disconnects_from_peers_if_told() {
+	fn disconnects_from_peer_if_told() {
 		let peer = PeerId::random();
 		let pset = peerset();
 		let mut swarm = make_swarm(true, pset.1, super::Config::default());
@@ -1090,24 +1093,21 @@ mod tests {
 	}
 
 	#[test]
-	fn disconnects_if_peer_times_out() {
+	fn disconnects_from_peer_if_request_times_out() {
 		let peer0 = PeerId::random();
 		let peer1 = PeerId::random();
 		let pset = peerset();
-		let mut handler = make_handler(true, pset.1, super::Config::default());
+		let mut swarm = make_swarm(true, pset.1, super::Config::default());
 
-		handler.inner.inject_connected(peer0.clone(), empty_dialer());
-		handler.inner.inject_connected(peer1.clone(), empty_dialer());
+		swarm.inject_connected(peer0.clone(), empty_dialer());
+		swarm.inject_connected(peer1.clone(), empty_dialer());
 
 		// We now know about two peers.
-		assert_eq!
-			( HashSet::from_iter(&[peer0.clone(), peer1.clone()])
-			, handler.inner.peers.keys().collect::<HashSet<_>>()
-			);
+		assert_eq!(HashSet::from_iter(&[peer0.clone(), peer1.clone()]), swarm.peers.keys().collect::<HashSet<_>>());
 
 		// No requests have been made yet.
-		assert!(handler.inner.pending_requests.is_empty());
-		assert!(handler.inner.outstanding.is_empty());
+		assert!(swarm.pending_requests.is_empty());
+		assert!(swarm.outstanding.is_empty());
 
 		// Issue our first request!
 		let chan = oneshot::channel();
@@ -1118,19 +1118,18 @@ mod tests {
 			call_data: vec![],
 			retry_count: Some(1),
 		};
-		handler.inner.request(LightClientRequest::Call(request, chan.0)).unwrap();
-		assert_eq!(1, handler.inner.pending_requests.len());
+		swarm.request(LightClientRequest::Call(request, chan.0)).unwrap();
+		assert_eq!(1, swarm.pending_requests.len());
 
 		// The behaviour should now attempt to send the request.
-		assert_matches!(handler.next_action(), NetworkBehaviourAction::SendEvent { peer_id, .. } => {
+		assert_matches!(swarm.next_behaviour_action(), NetworkBehaviourAction::SendEvent { peer_id, .. } => {
 			assert!(peer_id == peer0 || peer_id == peer1)
 		});
 
-		// And we should now have one busy peer.
+		// And we should have one busy peer.
 		assert!({
 			let (idle, busy): (Vec<_>, Vec<_>) =
-				handler.inner.peers.iter()
-					.partition(|(_, info)| info.status == PeerStatus::Idle);
+				swarm.peers.iter().partition(|(_, info)| info.status == PeerStatus::Idle);
 
 			idle.len() == 1 && busy.len() == 1
 				&& (idle[0].0 == &peer0 || busy[0].0 == &peer0)
@@ -1138,21 +1137,28 @@ mod tests {
 		});
 
 		// No more pending requests, but one should be outstanding.
-		assert!(handler.inner.pending_requests.is_empty());
-		assert_eq!(1, handler.inner.outstanding.len());
+		assert!(swarm.pending_requests.is_empty());
+		assert_eq!(1, swarm.outstanding.len());
 
-		// We now set back the timetamp of the outstanding request to make it expire.
-		let request = handler.inner.outstanding.values_mut().next().unwrap();
+		// We now set back the timestamp of the outstanding request to make it expire.
+		let request = swarm.outstanding.values_mut().next().unwrap();
 		request.timestamp -= super::Config::default().request_timeout;
 
 		// Make progress, but do not expect some action.
-		assert_matches!(handler.poll(), Ok(Async::NotReady));
+		assert_matches!(swarm.poll(), Ok(Async::NotReady));
 
 		// The request should have timed out by now and the corresponding peer be removed.
-		assert_eq!(1, handler.inner.peers.len());
+		assert_eq!(1, swarm.peers.len());
 		// Since we asked for one retry, the request should be back in the pending queue.
-		assert_eq!(1, handler.inner.pending_requests.len());
+		assert_eq!(1, swarm.pending_requests.len());
 		// No other request should be ongoing.
-		assert!(handler.inner.outstanding.is_empty());
+		assert!(swarm.outstanding.is_empty());
+	}
+
+	#[test]
+	fn disconnects_from_peer_on_response_with_wrong_id() {
+		let peer = PeerId::random();
+		let pset = peerset();
+		let mut swarm = make_swarm(true, pset.1, super::Config::default());
 	}
 }
