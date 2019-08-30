@@ -1,3 +1,11 @@
+//! [`NetworkBehaviour`] implementation which handles light client requests.
+//!
+//! Every request is coming in on a separate connection substream which gets
+//! closed after we have sent the response back. Requests and responses are
+//! encoded as protocol buffers (cf. `api.v1.proto`).
+//!
+//! For every outgoing request we likewise open a separate substream.
+
 use codec::{self, Encode, Decode};
 use client::{error::Error as ClientError, light::fetcher};
 use crate::{chain::Client, protocol::api};
@@ -26,6 +34,63 @@ use std::{
 };
 use tokio_io::{AsyncRead, AsyncWrite};
 use void::Void;
+
+/// Configuration options for `LightClientHandler` behaviour.
+#[derive(Debug, Clone)]
+pub struct Config {
+	max_data_size: usize,
+	max_pending_requests: usize,
+	inactivity_timeout: Duration,
+	request_timeout: Duration
+}
+
+impl Default for Config {
+	fn default() -> Self {
+		Config::new()
+	}
+}
+
+#[allow(unused)]
+impl Config {
+	/// Create a fresh configuration with the following options:
+	///
+	/// - `max_data_size` = 1 MiB
+	/// - `max_pending_requests` = 128
+	/// - `inactivity_timeout` = 15s
+	/// - `request_timeout` = 15s
+	pub fn new() -> Self {
+		Config {
+			max_data_size: 1024 * 1024,
+			max_pending_requests: 128,
+			inactivity_timeout: Duration::from_secs(15),
+			request_timeout: Duration::from_secs(15)
+		}
+	}
+
+	/// Limit the max. length of incoming request bytes.
+	pub fn set_max_data_size(&mut self, v: usize) -> &mut Self {
+		self.max_data_size = v;
+		self
+	}
+
+	/// Limit the max. number of pending requests.
+	pub fn set_max_pending_requests(&mut self, v: usize) -> &mut Self {
+		self.max_pending_requests = v;
+		self
+	}
+
+	/// Limit the max. duration the connection may remain inactive before closing it.
+	pub fn set_inactivity_timeout(&mut self, v: Duration) -> &mut Self {
+		self.inactivity_timeout = v;
+		self
+	}
+
+	/// Limit the max. request duration.
+	pub fn set_request_timeout(&mut self, v: Duration) -> &mut Self {
+		self.request_timeout = v;
+		self
+	}
+}
 
 /// Possible errors while handling light clients.
 #[derive(Debug)]
@@ -73,60 +138,13 @@ impl From<codec::Error> for Error {
 	}
 }
 
-/// Configuration options for `LightClientHandler`.
-#[derive(Debug, Clone)]
-pub struct Config {
-	max_data_size: usize,
-	max_pending_requests: usize,
-	inactivity_timeout: Duration,
-	request_timeout: Duration
-}
-
-impl Default for Config {
-	fn default() -> Self {
-		Config::new()
-	}
-}
-
-impl Config {
-	pub fn new() -> Self {
-		Config {
-			max_data_size: 1024 * 1024,
-			max_pending_requests: 128,
-			inactivity_timeout: Duration::from_secs(5),
-			request_timeout: Duration::from_secs(15)
-		}
-	}
-
-	/// Limit the max. length of incoming request bytes.
-	pub fn set_max_data_size(&mut self, v: usize) -> &mut Self {
-		self.max_data_size = v;
-		self
-	}
-
-	/// Limit the max. number of pending requests.
-	pub fn set_max_pending_requests(&mut self, v: usize) -> &mut Self {
-		self.max_pending_requests = v;
-		self
-	}
-
-	/// Limit the max. duration the connection may remain inactive before closing it.
-	pub fn set_inactivity_timeout(&mut self, v: Duration) -> &mut Self {
-		self.inactivity_timeout = v;
-		self
-	}
-
-	/// Limit the max. request duration.
-	pub fn set_request_timeout(&mut self, v: Duration) -> &mut Self {
-		self.request_timeout = v;
-		self
-	}
-}
-
 /// The possible light client requests we support.
 ///
 /// The associated `oneshot::Sender` will be used to convey the result of
 /// their request back to them (cf. `Reply`).
+//
+// This is modeled after light_dispatch.rs's `RequestData` which is not
+// used because we currently only support a subset of those.
 #[derive(Debug)]
 pub enum LightClientRequest<B: Block> {
 	Header(fetcher::RemoteHeaderRequest<B::Header>, oneshot::Sender<Result<B::Header, ClientError>>),
@@ -137,10 +155,10 @@ pub enum LightClientRequest<B: Block> {
 }
 
 /// The data to send back to the light client over the oneshot channel.
-///
-/// It is unified here in order to be able to return it as a function
-/// result instead of delivering it to the client as a side effect of
-/// response processing.
+//
+// It is unified here in order to be able to return it as a function
+// result instead of delivering it to the client as a side effect of
+// response processing.
 #[derive(Debug)]
 enum Reply<B: Block> {
 	VecU8(Vec<u8>),
@@ -180,7 +198,6 @@ enum PeerStatus {
 }
 
 /// The light client handler behaviour.
-// TODO (after https://github.com/libp2p/rust-libp2p/pull/1226): #[derive(Debug)]
 pub struct LightClientHandler<T, B: Block> {
 	/// This behaviour's configuration.
 	config: Config,
@@ -190,13 +207,13 @@ pub struct LightClientHandler<T, B: Block> {
 	checker: Arc<dyn fetcher::FetchChecker<B>>,
 	/// Peer information (addresses, their best block, etc.)
 	peers: HashMap<PeerId, PeerInfo<B>>,
-	/// Pending response futures.
+	/// Pending futures sending back response to remote clients.
 	responses: VecDeque<WriteOne<Negotiated<T>, Vec<u8>>>,
-	/// Pending requests.
+	/// Pending (local) requests.
 	pending_requests: VecDeque<RequestWrapper<B, ()>>,
-	/// In flight requests.
+	/// Requests on their way to remote peers.
 	outstanding: HashMap<u64, RequestWrapper<B, PeerId>>,
-	/// Request ID counter
+	/// (Local) Request ID counter
 	next_request_id: u64,
 	/// Handle to use for reporting misbehaviour of peers.
 	peerset: peerset::PeersetHandle
@@ -228,7 +245,7 @@ where
 		}
 	}
 
-	/// We rely on external information about peers best block as we lack the
+	/// We rely on external information about peers best blocks as we lack the
 	/// means to determine it ourselves.
 	pub fn update_best_block(&mut self, peer: &PeerId, num: NumberFor<B>) {
 		if let Some(info) = self.peers.get_mut(peer) {
@@ -257,6 +274,7 @@ where
 		id
 	}
 
+	// Iterate over peers known to possess a certain block.
 	fn idle_peers_with_block(&mut self, num: NumberFor<B>) -> impl Iterator<Item = PeerId> + '_ {
 		self.peers.iter()
 			.filter(move |(_, info)| {
@@ -265,6 +283,7 @@ where
 			.map(|(peer, _)| peer.clone())
 	}
 
+	// Iterate over peers without a known block.
 	fn idle_peers_with_unknown_block(&mut self) -> impl Iterator<Item = PeerId> + '_ {
 		self.peers.iter()
 			.filter(|(_, info)| {
@@ -276,7 +295,7 @@ where
 	/// Remove the given peer.
 	///
 	/// If we have a request to this peer in flight, we move it back to
-	/// (the front of) the pending requests queue.
+	/// the pending requests queue.
 	fn remove_peer(&mut self, peer: &PeerId) {
 		if let Some(id) = self.outstanding.iter().find(|(_, rw)| &rw.peer == peer).map(|(k, _)| *k) {
 			let rw = self.outstanding.remove(&id).expect("key belongs to entry in this map");
@@ -291,7 +310,7 @@ where
 		self.peers.remove(peer);
 	}
 
-	/// Process a request's response.
+	/// Process a local request's response from remote.
 	///
 	/// If successful, this will give us the actual, checked data we should be
 	/// sending back to the client, otherwise an error.
@@ -574,6 +593,8 @@ where
 					Some(api::v1::light::request::Request::RemoteHeaderRequest(r)) =>
 						self.on_remote_header_request(&peer, request.id, r),
 					Some(api::v1::light::request::Request::RemoteReadChildRequest(_)) => {
+						// Match protocol.rs behaviour.
+						// Cf. https://github.com/paritytech/substrate/blob/9b3e9f/core/network/src/protocol.rs#L550
 						trace!("ignoring remote read child request {} from {}", request.id, peer);
 						return
 					}
@@ -597,7 +618,7 @@ where
 					Err(e) => debug!("error handling request {} from peer {}: {}", request.id, peer, e)
 				}
 			}
-			// A response to one of our requests has been received.
+			// A response to one of our own requests has been received.
 			Event::Response(response) => {
 				let id = response.id;
 				if let Some(request) = self.outstanding.remove(&id) {
@@ -622,7 +643,7 @@ where
 							panic!("unexpected peer status {:?} for {}", info.status, peer);
 						}
 
-						info.status = PeerStatus::Idle;
+						info.status = PeerStatus::Idle; // Make peer available again.
 
 						match self.on_response(&peer, &request.request, response) {
 							Ok(reply) => send_reply(Ok(reply), request.request),
@@ -673,6 +694,20 @@ where
 	}
 
 	fn poll(&mut self, _: &mut impl PollParameters) -> Async<NetworkBehaviourAction<OutboundProtocol, Void>> {
+		// Process response sending futures.
+		let mut remaining = self.responses.len();
+		while let Some(mut io) = self.responses.pop_front() {
+			remaining -= 1;
+			match io.poll() {
+				Ok(Async::NotReady) => self.responses.push_back(io),
+				Ok(Async::Ready(())) => {}
+				Err(e) => debug!("error writing response: {}", e)
+			}
+			if remaining == 0 {
+				break
+			}
+		}
+
 		// If we have a pending request to send, try to find an available peer and send it.
 		let now = Instant::now();
 		while let Some(mut request) = self.pending_requests.pop_front() {
@@ -745,20 +780,6 @@ where
 					peer: ()
 				};
 				self.pending_requests.push_back(rw)
-			}
-		}
-
-		// Process response sending futures.
-		let mut remaining = self.responses.len();
-		while let Some(mut io) = self.responses.pop_front() {
-			remaining -= 1;
-			match io.poll() {
-				Ok(Async::NotReady) => self.responses.push_back(io),
-				Ok(Async::Ready(())) => {}
-				Err(e) => debug!("error writing response: {}", e)
-			}
-			if remaining == 0 {
-				break
 			}
 		}
 
@@ -953,13 +974,47 @@ mod tests {
 	use libp2p::{
 		PeerId,
 		Multiaddr,
-		core::ConnectedPoint,
+		core::{
+			ConnectedPoint,
+			identity,
+			muxing::{StreamMuxerBox, SubstreamRef},
+			transport::{Transport, boxed::Boxed, memory::MemoryTransport},
+			upgrade
+		},
+		noise::{self, Keypair, X25519, NoiseConfig},
 		swarm::{NetworkBehaviour, NetworkBehaviourAction, PollParameters},
+		yamux
 	};
 	use std::{collections::HashSet, io, iter::{self, FromIterator}, sync::Arc};
 	use super::{Event, LightClientHandler, LightClientRequest, OutboundProtocol, PeerStatus};
 	use test_client::runtime::{changes_trie_config, Block};
+	use tokio_io::{AsyncRead, AsyncWrite};
 	use void::Void;
+
+	type Handler = LightClientHandler<SubstreamRef<Arc<StreamMuxerBox>>, Block>;
+	type Swarm = libp2p::swarm::Swarm<Boxed<(PeerId, StreamMuxerBox), io::Error>, Handler>;
+
+	fn make_swarm(ok: bool, ps: peerset::PeersetHandle, cf: super::Config) -> Swarm {
+		let id_key = identity::Keypair::generate_ed25519();
+		let dh_key = Keypair::<X25519>::new().into_authentic(&id_key).unwrap();
+		let local_peer = id_key.public().into_peer_id();
+		let transport = MemoryTransport::default()
+			.with_upgrade(NoiseConfig::xx(dh_key))
+			.and_then(move |(remote, stream), endpoint| {
+				let peer =
+					if let noise::RemoteIdentity::IdentityKey(k) = remote {
+						k.into_peer_id()
+					} else {
+						panic!("Expected IdentityKey")
+					};
+				upgrade::apply(stream, yamux::Config::default(), endpoint).map(|m| (peer, StreamMuxerBox::new(m)))
+			})
+			.map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+			.boxed();
+		let client = Arc::new(test_client::new());
+		let checker = Arc::new(DummyFetchChecker { ok });
+		libp2p::swarm::Swarm::new(transport, LightClientHandler::new(cf, client, checker, ps), local_peer)
+	}
 
 	struct EmptyPollParams(PeerId);
 
@@ -1011,9 +1066,8 @@ mod tests {
 		ConnectedPoint::Dialer { address: Multiaddr::empty() }
 	}
 
-	fn poll
-		( b: &mut LightClientHandler<io::Cursor<Vec<u8>>, Block>
-		) -> Async<NetworkBehaviourAction<OutboundProtocol, Void>>
+	fn poll<T>(b: &mut LightClientHandler<T, Block>) -> Async<NetworkBehaviourAction<OutboundProtocol, Void>>
+		where T: AsyncRead + AsyncWrite
 	{
 		b.poll(&mut EmptyPollParams(PeerId::random()))
 	}
@@ -1460,5 +1514,109 @@ mod tests {
 		};
 		issue_request(LightClientRequest::Changes(request, chan.0));
 		assert_matches!(chan.1.try_recv(), Ok(Some(Ok(_))))
+	}
+
+	fn send_receive(runtime: &mut tokio::runtime::Runtime, request: LightClientRequest<Block>) {
+		// We start a swarm on the listening side which awaits incoming requests and answers them:
+		let local_pset = peerset();
+		let local_listen_addr: libp2p::Multiaddr = libp2p::multiaddr::Protocol::Memory(rand::random()).into();
+		let mut local_swarm = make_swarm(true, local_pset.1, super::Config::default());
+		Swarm::listen_on(&mut local_swarm, local_listen_addr.clone()).unwrap();
+
+		// We also start a swarm that makes requests and awaits responses:
+		let remote_pset = peerset();
+		let mut remote_swarm = make_swarm(true, remote_pset.1, super::Config::default());
+
+		// We now schedule a request, dial the remote and let the two swarm work it out:
+		remote_swarm.request(request).unwrap();
+		Swarm::dial_addr(&mut remote_swarm, local_listen_addr).unwrap();
+
+		runtime.spawn(local_swarm.for_each(|_| Ok(()))
+			.join(remote_swarm.for_each(|_| Ok(())))
+			.map(|_| ())
+			.map_err(|e| panic!("{}", e)));
+	}
+
+	#[test]
+	fn send_receive_call() {
+		let chan = oneshot::channel();
+		let request = fetcher::RemoteCallRequest {
+			block: Default::default(),
+			header: dummy_header(),
+			method: "test".into(),
+			call_data: vec![],
+			retry_count: None
+		};
+		let mut runtime = tokio::runtime::Runtime::new().expect("new tokio runtime");
+		send_receive(&mut runtime, LightClientRequest::Call(request, chan.0));
+		assert_eq!(vec![42], chan.1.wait().unwrap().unwrap());
+		//              ^--- from `DummyFetchChecker::check_execution_proof`
+	}
+
+	#[test]
+	fn send_receive_read() {
+		let chan = oneshot::channel();
+		let request = fetcher::RemoteReadRequest {
+			header: dummy_header(),
+			block: Default::default(),
+			key: b":key".to_vec(),
+			retry_count: None
+		};
+		let mut runtime = tokio::runtime::Runtime::new().expect("new tokio runtime");
+		send_receive(&mut runtime, LightClientRequest::Read(request, chan.0));
+		assert_eq!(Some(vec![42]), chan.1.wait().unwrap().unwrap());
+		//                   ^--- from `DummyFetchChecker::check_read_proof`
+	}
+
+	// At the moment, remote read child requests are ignored.
+	// Cf. https://github.com/paritytech/substrate/blob/9b3e9f/core/network/src/protocol.rs#L550
+	#[test]
+	#[ignore]
+	fn send_receive_read_child() {
+		let chan = oneshot::channel();
+		let request = fetcher::RemoteReadChildRequest {
+			header: dummy_header(),
+			block: Default::default(),
+			storage_key: b":child_storage:sub".to_vec(),
+			key: b":key".to_vec(),
+			retry_count: None
+		};
+		let mut runtime = tokio::runtime::Runtime::new().expect("new tokio runtime");
+		send_receive(&mut runtime, LightClientRequest::ReadChild(request, chan.0));
+		assert_eq!(Some(vec![42]), chan.1.wait().unwrap().unwrap());
+		//                   ^--- from `DummyFetchChecker::check_read_child_proof`
+	}
+
+	#[test]
+	fn send_receive_header() {
+		let _ = env_logger::try_init();
+		let chan = oneshot::channel();
+		let request = fetcher::RemoteHeaderRequest {
+			cht_root: Default::default(),
+			block: 1,
+			retry_count: None
+		};
+		let mut runtime = tokio::runtime::Runtime::new().expect("new tokio runtime");
+		send_receive(&mut runtime, LightClientRequest::Header(request, chan.0));
+		// The remote does not know block 1:
+		assert_matches!(chan.1.wait().unwrap(), Err(ClientError::RemoteFetchFailed));
+	}
+
+	#[test]
+	fn send_receive_changes() {
+		let chan = oneshot::channel();
+		let request = fetcher::RemoteChangesRequest {
+			changes_trie_config: changes_trie_config(),
+			first_block: (1, Default::default()),
+			last_block: (100, Default::default()),
+			max_block: (100, Default::default()),
+			tries_roots: (1, Default::default(), Vec::new()),
+			key: Vec::new(),
+			retry_count: None
+		};
+		let mut runtime = tokio::runtime::Runtime::new().expect("new tokio runtime");
+		send_receive(&mut runtime, LightClientRequest::Changes(request, chan.0));
+		assert_eq!(vec![(100, 2)], chan.1.wait().unwrap().unwrap());
+		//              ^--- from `DummyFetchChecker::check_changes_proof`
 	}
 }
