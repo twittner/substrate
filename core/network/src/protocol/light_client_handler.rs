@@ -450,6 +450,44 @@ where
 		Ok(api::v1::light::Response { id: request_id, response: Some(response) })
 	}
 
+	fn on_remote_read_child_request
+		( &mut self
+		, peer: &PeerId
+		, request_id: u64
+		, request: &api::v1::light::RemoteReadChildRequest
+		) -> Result<api::v1::light::Response, Error>
+	{
+		trace!("remote read child request {} from {} ({} {} at {:?})",
+			request_id,
+			peer,
+			request.storage_key.to_hex::<String>(),
+			request.key.to_hex::<String>(),
+			request.block);
+
+		let block = Decode::decode(&mut request.block.as_ref())?;
+
+		let proof = match self.chain.read_child_proof(&block, &request.storage_key, &request.key) {
+			Ok(proof) => proof,
+			Err(error) => {
+				trace!("remote read child request {} from {} ({} {} at {:?}) failed with: {}",
+					request_id,
+					peer,
+					request.storage_key.to_hex::<String>(),
+					request.key.to_hex::<String>(),
+					request.block,
+					error);
+				Vec::new()
+			}
+		};
+
+		let response = {
+			let r = api::v1::light::RemoteReadResponse { proof };
+			api::v1::light::response::Response::RemoteReadResponse(r)
+		};
+
+		Ok(api::v1::light::Response { id: request_id, response: Some(response) })
+	}
+
 	fn on_remote_header_request
 		( &mut self
 		, peer: &PeerId
@@ -592,12 +630,8 @@ where
 						self.on_remote_read_request(&peer, request.id, r),
 					Some(api::v1::light::request::Request::RemoteHeaderRequest(r)) =>
 						self.on_remote_header_request(&peer, request.id, r),
-					Some(api::v1::light::request::Request::RemoteReadChildRequest(_)) => {
-						// Match protocol.rs behaviour.
-						// Cf. https://github.com/paritytech/substrate/blob/9b3e9f/core/network/src/protocol.rs#L550
-						trace!("ignoring remote read child request {} from {}", request.id, peer);
-						return
-					}
+					Some(api::v1::light::request::Request::RemoteReadChildRequest(r)) =>
+						self.on_remote_read_child_request(&peer, request.id, r),
 					Some(api::v1::light::request::Request::RemoteChangesRequest(r)) =>
 						self.on_remote_changes_request(&peer, request.id, r),
 					None => {
@@ -1568,10 +1602,7 @@ mod tests {
 		//                   ^--- from `DummyFetchChecker::check_read_proof`
 	}
 
-	// At the moment, remote read child requests are ignored.
-	// Cf. https://github.com/paritytech/substrate/blob/9b3e9f/core/network/src/protocol.rs#L550
 	#[test]
-	#[ignore]
 	fn send_receive_read_child() {
 		let chan = oneshot::channel();
 		let request = fetcher::RemoteReadChildRequest {
