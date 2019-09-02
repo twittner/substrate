@@ -42,7 +42,8 @@ pub type Error = Box<dyn std::error::Error + 'static>;
 pub struct Config {
 	max_block_data_response: u32,
 	max_request_len: usize,
-	inactivity_timeout: Duration
+	inactivity_timeout: Duration,
+	protocol: &'static [u8],
 }
 
 impl Default for Config {
@@ -53,11 +54,18 @@ impl Default for Config {
 
 #[allow(unused)]
 impl Config {
+	/// Create a fresh configuration with the following options:
+	///
+	/// - max. block data in response = 128
+	/// - max. request size = 1 MiB
+	/// - inactivity timeout = 15s
+	/// - protocol string = b"/polkadot/sync/1"
 	pub fn new() -> Self {
 		Config {
 			max_block_data_response: 128,
 			max_request_len: 1024 * 1024,
-			inactivity_timeout: Duration::from_secs(5)
+			inactivity_timeout: Duration::from_secs(15),
+			protocol: b"/polkadot/sync/1",
 		}
 	}
 
@@ -78,6 +86,12 @@ impl Config {
 		self.inactivity_timeout = v;
 		self
 	}
+
+	/// Set protocol string to use for upgrade negotiation.
+	pub fn set_protocol_string(&mut self, s: &'static [u8]) -> &mut Self {
+		self.protocol = s;
+		self
+	}
 }
 
 /// The block request handling behaviour.
@@ -87,19 +101,19 @@ pub struct BlockRequests<T, B: Block> {
 	/// Blockchain client.
 	chain: Arc<dyn Client<B>>,
 	/// Pending futures, sending back the block request response.
-	outgoing: VecDeque<WriteOne<Negotiated<T>, Vec<u8>>>
+	outgoing: VecDeque<WriteOne<Negotiated<T>, Vec<u8>>>,
 }
 
 impl<T, B> BlockRequests<T, B>
 where
 	T: AsyncRead + AsyncWrite,
-	B: Block
+	B: Block,
 {
 	pub fn new(cfg: Config, chain: Arc<dyn Client<B>>) -> Self {
 		BlockRequests {
 			config: cfg,
 			chain,
-			outgoing: VecDeque::new()
+			outgoing: VecDeque::new(),
 		}
 	}
 
@@ -220,7 +234,8 @@ where
 
 	fn new_handler(&mut self) -> Self::ProtocolsHandler {
 		let p = Protocol {
-			max_request_len: self.config.max_request_len
+			max_request_len: self.config.max_request_len,
+			protocol_string: self.config.protocol,
 		};
 		OneShotHandler::new(SubstreamProtocol::new(p), self.config.inactivity_timeout)
 	}
@@ -289,7 +304,9 @@ impl<T> From<Void> for Request<T> {
 #[derive(Debug, Clone)]
 pub struct Protocol {
 	/// The max. request length in bytes.
-	max_request_len: usize
+	max_request_len: usize,
+	/// The protocol string to use during upgrade negotiation.
+	protocol_string: &'static [u8],
 }
 
 impl UpgradeInfo for Protocol {
@@ -297,7 +314,7 @@ impl UpgradeInfo for Protocol {
     type InfoIter = iter::Once<Self::Info>;
 
     fn protocol_info(&self) -> Self::InfoIter {
-        iter::once(b"/polkadot/sync/1")
+        iter::once(self.protocol_string)
     }
 }
 
