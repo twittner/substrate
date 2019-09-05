@@ -4,9 +4,11 @@
 //! closed after we have sent the response back. Incoming requests are encoded
 //! as protocol buffers (cf. `api.v1.proto`).
 
+use bytes::Bytes;
 use codec::{Encode, Decode};
 use crate::{
 	chain::Client,
+	config::ProtocolId,
 	protocol::{api, message::BlockAttributes}
 };
 use futures::prelude::*;
@@ -43,13 +45,7 @@ pub struct Config {
 	max_block_data_response: u32,
 	max_request_len: usize,
 	inactivity_timeout: Duration,
-	protocol: &'static [u8],
-}
-
-impl Default for Config {
-	fn default() -> Self {
-		Config::new()
-	}
+	protocol: Bytes,
 }
 
 #[allow(unused)]
@@ -59,14 +55,15 @@ impl Config {
 	/// - max. block data in response = 128
 	/// - max. request size = 1 MiB
 	/// - inactivity timeout = 15s
-	/// - protocol string = b"/polkadot/sync/1"
-	pub fn new() -> Self {
-		Config {
+	pub fn new(id: &ProtocolId) -> Self {
+		let mut c = Config {
 			max_block_data_response: 128,
 			max_request_len: 1024 * 1024,
 			inactivity_timeout: Duration::from_secs(15),
-			protocol: b"/polkadot/sync/1",
-		}
+			protocol: Bytes::new(),
+		};
+		c.set_protocol(id);
+		c
 	}
 
 	/// Limit the max. number of block data in a response.
@@ -87,9 +84,13 @@ impl Config {
 		self
 	}
 
-	/// Set protocol string to use for upgrade negotiation.
-	pub fn set_protocol_string(&mut self, s: &'static [u8]) -> &mut Self {
-		self.protocol = s;
+	/// Set protocol to use for upgrade negotiation.
+	pub fn set_protocol(&mut self, id: &ProtocolId) -> &mut Self {
+		let mut v = Vec::new();
+		v.extend_from_slice(b"/");
+		v.extend_from_slice(id.as_bytes());
+		v.extend_from_slice(b"/sync/1");
+		self.protocol = v.into();
 		self
 	}
 }
@@ -235,7 +236,7 @@ where
 	fn new_handler(&mut self) -> Self::ProtocolsHandler {
 		let p = Protocol {
 			max_request_len: self.config.max_request_len,
-			protocol_string: self.config.protocol,
+			protocol: self.config.protocol.clone(),
 		};
 		OneShotHandler::new(SubstreamProtocol::new(p), self.config.inactivity_timeout)
 	}
@@ -305,16 +306,16 @@ impl<T> From<Void> for Request<T> {
 pub struct Protocol {
 	/// The max. request length in bytes.
 	max_request_len: usize,
-	/// The protocol string to use during upgrade negotiation.
-	protocol_string: &'static [u8],
+	/// The protocol to use during upgrade negotiation.
+	protocol: Bytes,
 }
 
 impl UpgradeInfo for Protocol {
-    type Info = &'static [u8];
+    type Info = Bytes;
     type InfoIter = iter::Once<Self::Info>;
 
     fn protocol_info(&self) -> Self::InfoIter {
-        iter::once(self.protocol_string)
+        iter::once(self.protocol.clone())
     }
 }
 

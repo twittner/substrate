@@ -207,7 +207,7 @@ impl<B: BlockT + 'static, S: NetworkSpecialization<B>, H: ExHashT> NetworkWorker
 			params.transaction_pool,
 			params.finality_proof_provider.clone(),
 			params.finality_proof_request_builder,
-			params.protocol_id,
+			params.protocol_id.clone(),
 			peerset_config,
 			params.block_announce_validator
 		)?;
@@ -220,11 +220,11 @@ impl<B: BlockT + 'static, S: NetworkSpecialization<B>, H: ExHashT> NetworkWorker
 				params.network_config.node_name
 			);
 			let block_requests = {
-				let config = protocol::block_requests::Config::default();
+				let config = protocol::block_requests::Config::new(&params.protocol_id);
 				protocol::BlockRequests::new(config, params.chain.clone())
 			};
 			let light_client_handler = {
-				let config = protocol::light_client_handler::Config::default();
+				let config = protocol::light_client_handler::Config::new(&params.protocol_id);
 				protocol::LightClientHandler::new(config, params.chain, checker, peerset_handle.clone())
 			};
 			let behaviour = futures::executor::block_on(Behaviour::new(

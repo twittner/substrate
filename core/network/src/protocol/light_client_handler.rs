@@ -6,9 +6,10 @@
 //!
 //! For every outgoing request we likewise open a separate substream.
 
+use bytes::Bytes;
 use codec::{self, Encode, Decode};
 use client::{error::Error as ClientError, light::fetcher};
-use crate::{chain::Client, protocol::api};
+use crate::{chain::Client, config::ProtocolId, protocol::api};
 use futures::{prelude::*, sync::oneshot};
 use libp2p::{
 	core::{
@@ -42,13 +43,7 @@ pub struct Config {
 	max_pending_requests: usize,
 	inactivity_timeout: Duration,
 	request_timeout: Duration,
-	protocol: &'static [u8],
-}
-
-impl Default for Config {
-	fn default() -> Self {
-		Config::new()
-	}
+	protocol: Bytes,
 }
 
 #[allow(unused)]
@@ -59,15 +54,16 @@ impl Config {
 	/// - max. pending requests = 128
 	/// - inactivity timeout = 15s
 	/// - request timeout = 15s
-	/// - protocol string = b"/polkadot/light/1"
-	pub fn new() -> Self {
-		Config {
+	pub fn new(id: &ProtocolId) -> Self {
+		let mut c = Config {
 			max_data_size: 1024 * 1024,
 			max_pending_requests: 128,
 			inactivity_timeout: Duration::from_secs(15),
 			request_timeout: Duration::from_secs(15),
-			protocol: b"/polkadot/light/1",
-		}
+			protocol: Bytes::new(),
+		};
+		c.set_protocol(id);
+		c
 	}
 
 	/// Limit the max. length of incoming request bytes.
@@ -94,9 +90,13 @@ impl Config {
 		self
 	}
 
-	/// Set protocol string to use for upgrade negotiation.
-	pub fn set_protocol_string(&mut self, s: &'static [u8]) -> &mut Self {
-		self.protocol = s;
+	/// Set protocol to use for upgrade negotiation.
+	pub fn set_protocol(&mut self, id: &ProtocolId) -> &mut Self {
+		let mut v = Vec::new();
+		v.extend_from_slice(b"/");
+		v.extend_from_slice(id.as_bytes());
+		v.extend_from_slice(b"/light/1");
+		self.protocol = v.into();
 		self
 	}
 }
@@ -595,7 +595,7 @@ where
 	fn new_handler(&mut self) -> Self::ProtocolsHandler {
 		let p = InboundProtocol {
 			max_data_size: self.config.max_data_size,
-			protocol_string: self.config.protocol,
+			protocol: self.config.protocol.clone(),
 		};
 		OneShotHandler::new(SubstreamProtocol::new(p), self.config.inactivity_timeout)
 	}
@@ -782,7 +782,7 @@ where
 					let protocol = OutboundProtocol {
 						request: buf,
 						max_data_size: self.config.max_data_size,
-						protocol_string: self.config.protocol,
+						protocol: self.config.protocol.clone(),
 					};
 					self.peers.get_mut(&peer).map(|info| info.status = PeerStatus::BusyWith(id));
 					let rw = RequestWrapper {
@@ -945,16 +945,16 @@ pub enum Event<T> {
 pub struct InboundProtocol {
 	/// The max. request length in bytes.
 	max_data_size: usize,
-	/// The protocol string to use for upgrade negotiation.
-	protocol_string: &'static [u8],
+	/// The protocol to use for upgrade negotiation.
+	protocol: Bytes,
 }
 
 impl UpgradeInfo for InboundProtocol {
-    type Info = &'static [u8];
+    type Info = Bytes;
     type InfoIter = iter::Once<Self::Info>;
 
     fn protocol_info(&self) -> Self::InfoIter {
-        iter::once(self.protocol_string)
+        iter::once(self.protocol.clone())
     }
 }
 
@@ -983,16 +983,16 @@ pub struct OutboundProtocol {
 	request: Vec<u8>,
 	/// The max. request length in bytes.
 	max_data_size: usize,
-	/// The protocol string to use for upgrade negotiation.
-	protocol_string: &'static [u8],
+	/// The protocol to use for upgrade negotiation.
+	protocol: Bytes,
 }
 
 impl UpgradeInfo for OutboundProtocol {
-    type Info = &'static [u8];
+    type Info = Bytes;
     type InfoIter = iter::Once<Self::Info>;
 
     fn protocol_info(&self) -> Self::InfoIter {
-        iter::once(self.protocol_string)
+        iter::once(self.protocol.clone())
     }
 }
 
@@ -1017,7 +1017,10 @@ mod tests {
 	use assert_matches::assert_matches;
 	use client::{error::Error as ClientError, light::fetcher};
 	use codec::Encode;
-	use crate::protocol::{api, light_dispatch::tests::{DummyFetchChecker, dummy_header}};
+	use crate::{
+		config::ProtocolId,
+		protocol::{api, light_dispatch::tests::{DummyFetchChecker, dummy_header}}
+	};
 	use futures::{prelude::*, sync::oneshot};
 	use libp2p::{
 		PeerId,
@@ -1062,6 +1065,10 @@ mod tests {
 		let client = Arc::new(test_client::new());
 		let checker = Arc::new(DummyFetchChecker { ok });
 		libp2p::swarm::Swarm::new(transport, LightClientHandler::new(cf, client, checker, ps), local_peer)
+	}
+
+	fn make_config() -> super::Config {
+		super::Config::new(&ProtocolId::from(&b"foo"[..]))
 	}
 
 	struct EmptyPollParams(PeerId);
@@ -1124,7 +1131,7 @@ mod tests {
 	fn disconnects_from_peer_if_told() {
 		let peer = PeerId::random();
 		let pset = peerset();
-		let mut behaviour = make_behaviour(true, pset.1, super::Config::default());
+		let mut behaviour = make_behaviour(true, pset.1, make_config());
 
 		behaviour.inject_connected(peer.clone(), empty_dialer());
 		assert_eq!(1, behaviour.peers.len());
@@ -1138,7 +1145,7 @@ mod tests {
 		let peer0 = PeerId::random();
 		let peer1 = PeerId::random();
 		let pset = peerset();
-		let mut behaviour = make_behaviour(true, pset.1, super::Config::default());
+		let mut behaviour = make_behaviour(true, pset.1, make_config());
 
 		behaviour.inject_connected(peer0.clone(), empty_dialer());
 		behaviour.inject_connected(peer1.clone(), empty_dialer());
@@ -1183,7 +1190,7 @@ mod tests {
 
 		// We now set back the timestamp of the outstanding request to make it expire.
 		let request = behaviour.outstanding.values_mut().next().unwrap();
-		request.timestamp -= super::Config::default().request_timeout;
+		request.timestamp -= make_config().request_timeout;
 
 		// Make progress, but do not expect some action.
 		assert_matches!(poll(&mut behaviour), Async::NotReady);
@@ -1200,7 +1207,7 @@ mod tests {
 	fn disconnects_from_peer_on_response_with_wrong_id() {
 		let peer = PeerId::random();
 		let pset = peerset();
-		let mut behaviour = make_behaviour(true, pset.1, super::Config::default());
+		let mut behaviour = make_behaviour(true, pset.1, make_config());
 
 		behaviour.inject_connected(peer.clone(), empty_dialer());
 		assert_eq!(1, behaviour.peers.len());
@@ -1247,7 +1254,7 @@ mod tests {
 	fn disconnects_from_peer_on_incorrect_response() {
 		let peer = PeerId::random();
 		let pset = peerset();
-		let mut behaviour = make_behaviour(false, pset.1, super::Config::default());
+		let mut behaviour = make_behaviour(false, pset.1, make_config());
 		//                                 ^--- Making sure the response data check fails.
 
 		behaviour.inject_connected(peer.clone(), empty_dialer());
@@ -1293,7 +1300,7 @@ mod tests {
 	fn disconnects_from_peer_on_unexpected_response() {
 		let peer = PeerId::random();
 		let pset = peerset();
-		let mut behaviour = make_behaviour(true, pset.1, super::Config::default());
+		let mut behaviour = make_behaviour(true, pset.1, make_config());
 
 		behaviour.inject_connected(peer.clone(), empty_dialer());
 		assert_eq!(1, behaviour.peers.len());
@@ -1321,7 +1328,7 @@ mod tests {
 	fn disconnects_from_peer_on_wrong_response_type() {
 		let peer = PeerId::random();
 		let pset = peerset();
-		let mut behaviour = make_behaviour(true, pset.1, super::Config::default());
+		let mut behaviour = make_behaviour(true, pset.1, make_config());
 
 		behaviour.inject_connected(peer.clone(), empty_dialer());
 		assert_eq!(1, behaviour.peers.len());
@@ -1369,7 +1376,7 @@ mod tests {
 		let peer3 = PeerId::random();
 		let peer4 = PeerId::random();
 		let pset = peerset();
-		let mut behaviour = make_behaviour(false, pset.1, super::Config::default());
+		let mut behaviour = make_behaviour(false, pset.1, make_config());
 		//                                 ^--- Making sure the response data check fails.
 
 		behaviour.inject_connected(peer1.clone(), empty_dialer());
@@ -1427,7 +1434,7 @@ mod tests {
 	fn issue_request(request: LightClientRequest<Block>) {
 		let peer = PeerId::random();
 		let pset = peerset();
-		let mut behaviour = make_behaviour(true, pset.1, super::Config::default());
+		let mut behaviour = make_behaviour(true, pset.1, make_config());
 
 		behaviour.inject_connected(peer.clone(), empty_dialer());
 		assert_eq!(1, behaviour.peers.len());
@@ -1568,12 +1575,12 @@ mod tests {
 		// We start a swarm on the listening side which awaits incoming requests and answers them:
 		let local_pset = peerset();
 		let local_listen_addr: libp2p::Multiaddr = libp2p::multiaddr::Protocol::Memory(rand::random()).into();
-		let mut local_swarm = make_swarm(true, local_pset.1, super::Config::default());
+		let mut local_swarm = make_swarm(true, local_pset.1, make_config());
 		Swarm::listen_on(&mut local_swarm, local_listen_addr.clone()).unwrap();
 
 		// We also start a swarm that makes requests and awaits responses:
 		let remote_pset = peerset();
-		let mut remote_swarm = make_swarm(true, remote_pset.1, super::Config::default());
+		let mut remote_swarm = make_swarm(true, remote_pset.1, make_config());
 
 		// We now schedule a request, dial the remote and let the two swarm work it out:
 		remote_swarm.request(request).unwrap();
