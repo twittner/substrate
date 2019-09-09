@@ -155,7 +155,7 @@ impl From<codec::Error> for Error {
 // This is modeled after light_dispatch.rs's `RequestData` which is not
 // used because we currently only support a subset of those.
 #[derive(Debug)]
-pub enum LightClientRequest<B: Block> {
+pub enum Request<B: Block> {
 	Header(fetcher::RemoteHeaderRequest<B::Header>, oneshot::Sender<Result<B::Header, ClientError>>),
 	Read(fetcher::RemoteReadRequest<B::Header>, oneshot::Sender<Result<Option<Vec<u8>>, ClientError>>),
 	ReadChild(fetcher::RemoteReadChildRequest<B::Header>, oneshot::Sender<Result<Option<Vec<u8>>, ClientError>>),
@@ -184,7 +184,7 @@ struct RequestWrapper<B: Block, P> {
 	/// Remaining retries.
 	retries: usize,
 	/// The actual request.
-	request: LightClientRequest<B>,
+	request: Request<B>,
 	/// Peer information, e.g. `PeerId`.
 	peer: P,
 }
@@ -263,7 +263,7 @@ where
 	}
 
 	/// Issue a new light client request.
-	pub fn request(&mut self, req: LightClientRequest<B>) -> Result<(), Error> {
+	pub fn request(&mut self, req: Request<B>) -> Result<(), Error> {
 		if self.pending_requests.len() >= self.config.max_pending_requests {
 			return Err(Error::TooManyRequests)
 		}
@@ -326,7 +326,7 @@ where
 	fn on_response
 		( &mut self
 		, peer: &PeerId
-		, request: &LightClientRequest<B>
+		, request: &Request<B>
 		, response: api::v1::light::Response
 		) -> Result<Reply<B>, Error>
 	{
@@ -334,7 +334,7 @@ where
 		use api::v1::light::response::Response;
 		match response.response {
 			Some(Response::RemoteCallResponse(res)) =>
-				if let LightClientRequest::Call(req, _) = request {
+				if let Request::Call(req, _) = request {
 					let reply = self.checker.check_execution_proof(req, res.proof)?;
 					Ok(Reply::VecU8(reply))
 				} else {
@@ -342,18 +342,18 @@ where
 				}
 			Some(Response::RemoteReadResponse(res)) =>
 				match request {
-					LightClientRequest::Read(req, _) => {
+					Request::Read(req, _) => {
 						let reply = self.checker.check_read_proof(&req, res.proof)?;
 						Ok(Reply::OptVecU8(reply))
 					}
-					LightClientRequest::ReadChild(req, _) => {
+					Request::ReadChild(req, _) => {
 						let reply = self.checker.check_read_child_proof(&req, res.proof)?;
 						Ok(Reply::OptVecU8(reply))
 					}
 					_ => Err(Error::UnexpectedResponse)
 				}
 			Some(Response::RemoteChangesResponse(res)) =>
-				if let LightClientRequest::Changes(req, _) = request {
+				if let Request::Changes(req, _) = request {
 					let max_block = Decode::decode(&mut res.max.as_ref())?;
 					let roots = {
 						let mut r = BTreeMap::new();
@@ -375,7 +375,7 @@ where
 					Err(Error::UnexpectedResponse)
 				}
 			Some(Response::RemoteHeaderResponse(res)) =>
-				if let LightClientRequest::Header(req, _) = request {
+				if let Request::Header(req, _) = request {
 					let header =
 						if res.header.is_empty() {
 							None
@@ -831,41 +831,41 @@ where
 	}
 }
 
-fn required_block<B: Block>(request: &LightClientRequest<B>) -> NumberFor<B> {
+fn required_block<B: Block>(request: &Request<B>) -> NumberFor<B> {
 	match request {
-		LightClientRequest::Header(data, _) => data.block,
-		LightClientRequest::Read(data, _) => *data.header.number(),
-		LightClientRequest::ReadChild(data, _) => *data.header.number(),
-		LightClientRequest::Call(data, _) => *data.header.number(),
-		LightClientRequest::Changes(data, _) => data.max_block.0,
+		Request::Header(data, _) => data.block,
+		Request::Read(data, _) => *data.header.number(),
+		Request::ReadChild(data, _) => *data.header.number(),
+		Request::Call(data, _) => *data.header.number(),
+		Request::Changes(data, _) => data.max_block.0,
 	}
 }
 
-fn retries<B: Block>(request: &LightClientRequest<B>) -> usize {
+fn retries<B: Block>(request: &Request<B>) -> usize {
 	let rc = match request {
-		LightClientRequest::Header(data, _) => data.retry_count,
-		LightClientRequest::Read(data, _) => data.retry_count,
-		LightClientRequest::ReadChild(data, _) => data.retry_count,
-		LightClientRequest::Call(data, _) => data.retry_count,
-		LightClientRequest::Changes(data, _) => data.retry_count,
+		Request::Header(data, _) => data.retry_count,
+		Request::Read(data, _) => data.retry_count,
+		Request::ReadChild(data, _) => data.retry_count,
+		Request::Call(data, _) => data.retry_count,
+		Request::Changes(data, _) => data.retry_count,
 	};
 	rc.unwrap_or(0)
 }
 
-fn serialise_request<B: Block>(id: u64, request: &LightClientRequest<B>) -> api::v1::light::Request {
+fn serialise_request<B: Block>(id: u64, request: &Request<B>) -> api::v1::light::Request {
 	let request = match request {
-		LightClientRequest::Header(data, _) => {
+		Request::Header(data, _) => {
 			let r = api::v1::light::RemoteHeaderRequest { block: data.block.encode() };
 			api::v1::light::request::Request::RemoteHeaderRequest(r)
 		}
-		LightClientRequest::Read(data, _) => {
+		Request::Read(data, _) => {
 			let r = api::v1::light::RemoteReadRequest {
 				block: data.block.encode(),
 				key: data.key.clone(),
 			};
 			api::v1::light::request::Request::RemoteReadRequest(r)
 		}
-		LightClientRequest::ReadChild(data, _) => {
+		Request::ReadChild(data, _) => {
 			let r = api::v1::light::RemoteReadChildRequest {
 				block: data.block.encode(),
 				storage_key: data.storage_key.clone(),
@@ -873,7 +873,7 @@ fn serialise_request<B: Block>(id: u64, request: &LightClientRequest<B>) -> api:
 			};
 			api::v1::light::request::Request::RemoteReadChildRequest(r)
 		}
-		LightClientRequest::Call(data, _) => {
+		Request::Call(data, _) => {
 			let r = api::v1::light::RemoteCallRequest {
 				block: data.block.encode(),
 				method: data.method.clone(),
@@ -881,7 +881,7 @@ fn serialise_request<B: Block>(id: u64, request: &LightClientRequest<B>) -> api:
 			};
 			api::v1::light::request::Request::RemoteCallRequest(r)
 		}
-		LightClientRequest::Changes(data, _) => {
+		Request::Changes(data, _) => {
 			let r = api::v1::light::RemoteChangesRequest {
 				first: data.first_block.1.encode(),
 				last: data.last_block.1.encode(),
@@ -896,32 +896,32 @@ fn serialise_request<B: Block>(id: u64, request: &LightClientRequest<B>) -> api:
 	api::v1::light::Request { id, request: Some(request) }
 }
 
-fn send_reply<B: Block>(result: Result<Reply<B>, ClientError>, request: LightClientRequest<B>) {
+fn send_reply<B: Block>(result: Result<Reply<B>, ClientError>, request: Request<B>) {
 	fn send<T>(item: T, sender: oneshot::Sender<T>) {
 		let _ = sender.send(item); // It is okay if the other end already hung up.
 	}
 	match request {
-		LightClientRequest::Header(req, sender) => match result {
+		Request::Header(req, sender) => match result {
 			Err(e) => send(Err(e), sender),
 			Ok(Reply::Header(x)) => send(Ok(x), sender),
 			reply => error!("invalid reply for header request: {:?}, {:?}", reply, req),
 		}
-		LightClientRequest::Read(req, sender) => match result {
+		Request::Read(req, sender) => match result {
 			Err(e) => send(Err(e), sender),
 			Ok(Reply::OptVecU8(x)) => send(Ok(x), sender),
 			reply => error!("invalid reply for read request: {:?}, {:?}", reply, req),
 		}
-		LightClientRequest::ReadChild(req, sender) => match result {
+		Request::ReadChild(req, sender) => match result {
 			Err(e) => send(Err(e), sender),
 			Ok(Reply::OptVecU8(x)) => send(Ok(x), sender),
 			reply => error!("invalid reply for read child request: {:?}, {:?}", reply, req),
 		}
-		LightClientRequest::Call(req, sender) => match result {
+		Request::Call(req, sender) => match result {
 			Err(e) => send(Err(e), sender),
 			Ok(Reply::VecU8(x)) => send(Ok(x), sender),
 			reply => error!("invalid reply for call request: {:?}, {:?}", reply, req),
 		}
-		LightClientRequest::Changes(req, sender) => match result {
+		Request::Changes(req, sender) => match result {
 			Err(e) => send(Err(e), sender),
 			Ok(Reply::VecNumberU32(x)) => send(Ok(x), sender),
 			reply => error!("invalid reply for changes request: {:?}, {:?}", reply, req),
@@ -1037,7 +1037,7 @@ mod tests {
 		yamux
 	};
 	use std::{collections::HashSet, io, iter::{self, FromIterator}, sync::Arc};
-	use super::{Event, LightClientHandler, LightClientRequest, OutboundProtocol, PeerStatus};
+	use super::{Event, LightClientHandler, Request, OutboundProtocol, PeerStatus};
 	use test_client::runtime::{changes_trie_config, Block};
 	use tokio_io::{AsyncRead, AsyncWrite};
 	use void::Void;
@@ -1166,7 +1166,7 @@ mod tests {
 			call_data: vec![],
 			retry_count: Some(1),
 		};
-		behaviour.request(LightClientRequest::Call(request, chan.0)).unwrap();
+		behaviour.request(Request::Call(request, chan.0)).unwrap();
 		assert_eq!(1, behaviour.pending_requests.len());
 
 		// The behaviour should now attempt to send the request.
@@ -1220,7 +1220,7 @@ mod tests {
 			call_data: vec![],
 			retry_count: Some(1),
 		};
-		behaviour.request(LightClientRequest::Call(request, chan.0)).unwrap();
+		behaviour.request(Request::Call(request, chan.0)).unwrap();
 
 		assert_eq!(1, behaviour.pending_requests.len());
 		assert_eq!(0, behaviour.outstanding.len());
@@ -1268,7 +1268,7 @@ mod tests {
 			call_data: vec![],
 			retry_count: Some(1),
 		};
-		behaviour.request(LightClientRequest::Call(request, chan.0)).unwrap();
+		behaviour.request(Request::Call(request, chan.0)).unwrap();
 
 		assert_eq!(1, behaviour.pending_requests.len());
 		assert_eq!(0, behaviour.outstanding.len());
@@ -1341,7 +1341,7 @@ mod tests {
 			call_data: vec![],
 			retry_count: Some(1),
 		};
-		behaviour.request(LightClientRequest::Call(request, chan.0)).unwrap();
+		behaviour.request(Request::Call(request, chan.0)).unwrap();
 
 		assert_eq!(1, behaviour.pending_requests.len());
 		assert_eq!(0, behaviour.outstanding.len());
@@ -1393,7 +1393,7 @@ mod tests {
 			call_data: vec![],
 			retry_count: Some(3), // Attempt up to three retries.
 		};
-		behaviour.request(LightClientRequest::Call(request, chan.0)).unwrap();
+		behaviour.request(Request::Call(request, chan.0)).unwrap();
 
 		assert_eq!(1, behaviour.pending_requests.len());
 		assert_eq!(0, behaviour.outstanding.len());
@@ -1431,7 +1431,7 @@ mod tests {
 		assert_matches!(chan.1.try_recv(), Ok(Some(Err(ClientError::RemoteFetchFailed))))
 	}
 
-	fn issue_request(request: LightClientRequest<Block>) {
+	fn issue_request(request: Request<Block>) {
 		let peer = PeerId::random();
 		let pset = peerset();
 		let mut behaviour = make_behaviour(true, pset.1, make_config());
@@ -1440,7 +1440,7 @@ mod tests {
 		assert_eq!(1, behaviour.peers.len());
 
 		let response = match request {
-			LightClientRequest::Header(..) => {
+			Request::Header(..) => {
 				let r = api::v1::light::RemoteHeaderResponse {
 					header: dummy_header().encode(),
 					proof: Vec::new(),
@@ -1450,28 +1450,28 @@ mod tests {
 					response: Some(api::v1::light::response::Response::RemoteHeaderResponse(r)),
 				}
 			}
-			LightClientRequest::Read(..) => {
+			Request::Read(..) => {
 				let r = api::v1::light::RemoteReadResponse { proof: Vec::new() };
 				api::v1::light::Response {
 					id: 1,
 					response: Some(api::v1::light::response::Response::RemoteReadResponse(r)),
 				}
 			}
-			LightClientRequest::ReadChild(..) => {
+			Request::ReadChild(..) => {
 				let r = api::v1::light::RemoteReadResponse { proof: Vec::new() };
 				api::v1::light::Response {
 					id: 1,
 					response: Some(api::v1::light::response::Response::RemoteReadResponse(r)),
 				}
 			}
-			LightClientRequest::Call(..) => {
+			Request::Call(..) => {
 				let r = api::v1::light::RemoteCallResponse { proof: Vec::new() };
 				api::v1::light::Response {
 					id: 1,
 					response: Some(api::v1::light::response::Response::RemoteCallResponse(r)),
 				}
 			}
-			LightClientRequest::Changes(..) => {
+			Request::Changes(..) => {
 				let r = api::v1::light::RemoteChangesResponse {
 					max: iter::repeat(1).take(32).collect(),
 					proof: Vec::new(),
@@ -1512,7 +1512,7 @@ mod tests {
 			call_data: vec![],
 			retry_count: None,
 		};
-		issue_request(LightClientRequest::Call(request, chan.0));
+		issue_request(Request::Call(request, chan.0));
 		assert_matches!(chan.1.try_recv(), Ok(Some(Ok(_))))
 	}
 
@@ -1525,7 +1525,7 @@ mod tests {
 			key: b":key".to_vec(),
 			retry_count: None,
 		};
-		issue_request(LightClientRequest::Read(request, chan.0));
+		issue_request(Request::Read(request, chan.0));
 		assert_matches!(chan.1.try_recv(), Ok(Some(Ok(_))))
 	}
 
@@ -1539,7 +1539,7 @@ mod tests {
 			key: b":key".to_vec(),
 			retry_count: None,
 		};
-		issue_request(LightClientRequest::ReadChild(request, chan.0));
+		issue_request(Request::ReadChild(request, chan.0));
 		assert_matches!(chan.1.try_recv(), Ok(Some(Ok(_))))
 	}
 
@@ -1551,7 +1551,7 @@ mod tests {
 			block: 1,
 			retry_count: None,
 		};
-		issue_request(LightClientRequest::Header(request, chan.0));
+		issue_request(Request::Header(request, chan.0));
 		assert_matches!(chan.1.try_recv(), Ok(Some(Ok(_))))
 	}
 
@@ -1567,11 +1567,11 @@ mod tests {
 			key: Vec::new(),
 			retry_count: None,
 		};
-		issue_request(LightClientRequest::Changes(request, chan.0));
+		issue_request(Request::Changes(request, chan.0));
 		assert_matches!(chan.1.try_recv(), Ok(Some(Ok(_))))
 	}
 
-	fn send_receive(runtime: &mut tokio::runtime::Runtime, request: LightClientRequest<Block>) {
+	fn send_receive(runtime: &mut tokio::runtime::Runtime, request: Request<Block>) {
 		// We start a swarm on the listening side which awaits incoming requests and answers them:
 		let local_pset = peerset();
 		let local_listen_addr: libp2p::Multiaddr = libp2p::multiaddr::Protocol::Memory(rand::random()).into();
@@ -1603,7 +1603,7 @@ mod tests {
 			retry_count: None,
 		};
 		let mut runtime = tokio::runtime::Runtime::new().expect("new tokio runtime");
-		send_receive(&mut runtime, LightClientRequest::Call(request, chan.0));
+		send_receive(&mut runtime, Request::Call(request, chan.0));
 		assert_eq!(vec![42], chan.1.wait().unwrap().unwrap());
 		//              ^--- from `DummyFetchChecker::check_execution_proof`
 	}
@@ -1618,7 +1618,7 @@ mod tests {
 			retry_count: None
 		};
 		let mut runtime = tokio::runtime::Runtime::new().expect("new tokio runtime");
-		send_receive(&mut runtime, LightClientRequest::Read(request, chan.0));
+		send_receive(&mut runtime, Request::Read(request, chan.0));
 		assert_eq!(Some(vec![42]), chan.1.wait().unwrap().unwrap());
 		//                   ^--- from `DummyFetchChecker::check_read_proof`
 	}
@@ -1634,7 +1634,7 @@ mod tests {
 			retry_count: None,
 		};
 		let mut runtime = tokio::runtime::Runtime::new().expect("new tokio runtime");
-		send_receive(&mut runtime, LightClientRequest::ReadChild(request, chan.0));
+		send_receive(&mut runtime, Request::ReadChild(request, chan.0));
 		assert_eq!(Some(vec![42]), chan.1.wait().unwrap().unwrap());
 		//                   ^--- from `DummyFetchChecker::check_read_child_proof`
 	}
@@ -1649,7 +1649,7 @@ mod tests {
 			retry_count: None,
 		};
 		let mut runtime = tokio::runtime::Runtime::new().expect("new tokio runtime");
-		send_receive(&mut runtime, LightClientRequest::Header(request, chan.0));
+		send_receive(&mut runtime, Request::Header(request, chan.0));
 		// The remote does not know block 1:
 		assert_matches!(chan.1.wait().unwrap(), Err(ClientError::RemoteFetchFailed));
 	}
@@ -1667,7 +1667,7 @@ mod tests {
 			retry_count: None,
 		};
 		let mut runtime = tokio::runtime::Runtime::new().expect("new tokio runtime");
-		send_receive(&mut runtime, LightClientRequest::Changes(request, chan.0));
+		send_receive(&mut runtime, Request::Changes(request, chan.0));
 		assert_eq!(vec![(100, 2)], chan.1.wait().unwrap().unwrap());
 		//              ^--- from `DummyFetchChecker::check_changes_proof`
 	}

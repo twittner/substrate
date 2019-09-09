@@ -19,7 +19,7 @@ use crate::{
 	Event, protocol::event::DhtEvent
 };
 use crate::{ExHashT, specialization::NetworkSpecialization};
-use crate::protocol::{self, CustomMessageOutcome, Protocol};
+use crate::protocol::{self, light_client_handler, CustomMessageOutcome, Protocol};
 use futures::prelude::*;
 use libp2p::NetworkBehaviour;
 use libp2p::core::{Multiaddr, PeerId, PublicKey};
@@ -127,9 +127,9 @@ impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> Behaviour<B, S, H> {
 		self.discovery.put_value(key, value);
 	}
 
-	/// Get unique access to the light client handler.
-	pub fn light_client_handler(&mut self) -> &mut protocol::LightClientHandler<Substream<StreamMuxerBox>, B> {
-		&mut self.light_client_handler
+	/// Issue a light client request.
+	pub fn request(&mut self, r: light_client_handler::Request<B>) -> Result<(), light_client_handler::Error> {
+		self.light_client_handler.request(r)
 	}
 }
 
