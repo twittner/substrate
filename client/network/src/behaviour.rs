@@ -128,7 +128,7 @@ impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> Behaviour<B, S, H> {
 	}
 
 	/// Issue a light client request.
-	pub fn request(&mut self, r: light_client_handler::Request<B>) -> Result<(), light_client_handler::Error> {
+	pub fn light_client_request(&mut self, r: light_client_handler::Request<B>) -> Result<(), light_client_handler::Error> {
 		self.light_client_handler.request(r)
 	}
 }
