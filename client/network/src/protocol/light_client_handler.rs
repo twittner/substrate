@@ -10,30 +10,31 @@ use bytes::Bytes;
 use codec::{self, Encode, Decode};
 use client::{error::Error as ClientError, light::fetcher};
 use crate::{chain::Client, config::ProtocolId, protocol::api};
-use futures::{prelude::*, sync::oneshot};
+use futures::{prelude::*, channel::oneshot};
 use libp2p::{
 	core::{
 		ConnectedPoint,
 		Multiaddr,
 		PeerId,
-		upgrade::{InboundUpgrade, ReadOneError, ReadRespond, UpgradeInfo, WriteOne, Negotiated, read_respond},
-		upgrade::{OutboundUpgrade, write_one, RequestResponse, request_response}
+		upgrade::{InboundUpgrade, ReadOneError, UpgradeInfo, Negotiated},
+		upgrade::{OutboundUpgrade, read_one, write_one}
 	},
 	swarm::{NetworkBehaviour, NetworkBehaviourAction, OneShotHandler, PollParameters, SubstreamProtocol}
 };
 use log::{debug, error, trace};
+use nohash_hasher::IntMap;
 use primitives::storage::StorageKey;
 use prost::Message;
 use rustc_hex::ToHex;
-use sr_primitives::traits::{Block, Header, NumberFor, Zero};
+use sp_runtime::traits::{Block, Header, NumberFor, Zero};
 use std::{
 	collections::{BTreeMap, VecDeque, HashMap},
 	fmt,
 	iter,
 	sync::Arc,
-	time::{Duration, Instant}
+	time::{Duration, Instant},
+	task::Poll
 };
-use tokio_io::{AsyncRead, AsyncWrite};
 use void::Void;
 
 /// Configuration options for `LightClientHandler` behaviour.
@@ -102,49 +103,20 @@ impl Config {
 }
 
 /// Possible errors while handling light clients.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
 	/// There are currently too many pending request.
+	#[error("too many pending requests")]
 	TooManyRequests,
 	/// The response type does not correspond to the issued request.
+	#[error("unexpected response")]
 	UnexpectedResponse,
 	/// The chain client errored.
-	Client(ClientError),
+	#[error("client error: {0}")]
+	Client(#[from] ClientError),
 	/// Encoding or decoding of some data failed.
-	Codec(codec::Error),
-}
-
-impl fmt::Display for Error {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		match self {
-			Error::TooManyRequests => f.write_str("too many pending requests"),
-			Error::UnexpectedResponse => f.write_str("unexpected response"),
-			Error::Client(e) => write!(f, "client error: {}", e),
-			Error::Codec(e) => write!(f, "codec error: {}", e),
-		}
-	}
-}
-
-impl std::error::Error for Error {
-	fn cause(&self) -> Option<&(dyn std::error::Error + 'static)> {
-		match self {
-			Error::Client(e) => Some(e),
-			Error::Codec(e) => Some(e),
-			Error::UnexpectedResponse | Error::TooManyRequests => None,
-		}
-	}
-}
-
-impl From<ClientError> for Error {
-	fn from(e: ClientError) -> Self {
-		Error::Client(e)
-	}
-}
-
-impl From<codec::Error> for Error {
-	fn from(e: codec::Error) -> Self {
-		Error::Codec(e)
-	}
+	#[error("codec error: {0}")]
+	Codec(#[from] codec::Error),
 }
 
 /// The possible light client requests we support.
@@ -221,7 +193,7 @@ pub struct LightClientHandler<T, B: Block> {
 	/// Pending (local) requests.
 	pending_requests: VecDeque<RequestWrapper<B, ()>>,
 	/// Requests on their way to remote peers.
-	outstanding: HashMap<u64, RequestWrapper<B, PeerId>>,
+	outstanding: IntMap<u64, RequestWrapper<B, PeerId>>,
 	/// (Local) Request ID counter
 	next_request_id: u64,
 	/// Handle to use for reporting misbehaviour of peers.
@@ -248,7 +220,7 @@ where
 			peers: HashMap::new(),
 			responses: VecDeque::new(),
 			pending_requests: VecDeque::new(),
-			outstanding: HashMap::new(),
+			outstanding: IntMap::new(),
 			next_request_id: 1,
 			peerset,
 		}

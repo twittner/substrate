@@ -11,29 +11,29 @@ use crate::{
 	config::ProtocolId,
 	protocol::{api, message::BlockAttributes}
 };
-use futures::prelude::*;
+use futures::{future::BoxFuture, prelude::*};
 use libp2p::{
 	core::{
 		ConnectedPoint,
 		Multiaddr,
 		PeerId,
-		upgrade::{InboundUpgrade, ReadOneError, ReadRespond, UpgradeInfo, WriteOne, Negotiated, read_respond},
-		upgrade::{DeniedUpgrade, write_one}
+		upgrade::{InboundUpgrade, ReadOneError, UpgradeInfo, Negotiated},
+		upgrade::{DeniedUpgrade, read_one, write_one}
 	},
 	swarm::{NetworkBehaviour, NetworkBehaviourAction, OneShotHandler, PollParameters, SubstreamProtocol}
 };
 use log::{debug, trace};
 use prost::Message;
-use sr_primitives::{generic::BlockId, traits::{Block, Header, One, Zero}};
+use sp_runtime::{generic::BlockId, traits::{Block, Header, One, Zero}};
 use std::{
 	cmp::min,
 	collections::VecDeque,
 	io,
 	iter,
 	sync::Arc,
-	time::Duration
+	time::Duration,
+	task::Poll
 };
-use tokio_io::{AsyncRead, AsyncWrite};
 use void::{Void, unreachable};
 
 // Type alias for convenience.
@@ -102,7 +102,7 @@ pub struct BlockRequests<T, B: Block> {
 	/// Blockchain client.
 	chain: Arc<dyn Client<B>>,
 	/// Pending futures, sending back the block request response.
-	outgoing: VecDeque<WriteOne<Negotiated<T>, Vec<u8>>>,
+	outgoing: VecDeque<BoxFuture<'static, ()>>,
 }
 
 impl<T, B> BlockRequests<T, B>
@@ -266,20 +266,20 @@ where
 		}
 	}
 
-	fn poll(&mut self, _: &mut impl PollParameters) -> Async<NetworkBehaviourAction<DeniedUpgrade, Void>> {
+	fn poll(&mut self, _: &mut impl PollParameters) -> Poll<NetworkBehaviourAction<DeniedUpgrade, Void>> {
 		let mut remaining = self.outgoing.len();
 		while let Some(mut write_future) = self.outgoing.pop_front() {
 			remaining -= 1;
 			match write_future.poll() {
-				Ok(Async::NotReady) => self.outgoing.push_back(write_future),
-				Ok(Async::Ready(())) => {}
+				Ok(Poll::Pending) => self.outgoing.push_back(write_future),
+				Ok(Poll::Ready(())) => {}
 				Err(e) => debug!("error writing block response: {}", e)
 			}
 			if remaining == 0 {
 				break
 			}
 		}
-		Async::NotReady
+		Poll::Pending
 	}
 }
 
@@ -322,16 +322,17 @@ impl UpgradeInfo for Protocol {
 impl<T: AsyncRead + AsyncWrite> InboundUpgrade<T> for Protocol {
     type Output = Request<T>;
     type Error = ReadOneError;
-    type Future = ReadRespond<Negotiated<T>, (), fn(Negotiated<T>, Vec<u8>, ()) -> Result<Self::Output, Self::Error>>;
+    type Future = BoxFuture<'static, Result<Self::Output, Self::Error>>;
 
-    fn upgrade_inbound(self, s: Negotiated<T>, _: Self::Info) -> Self::Future {
-		read_respond(s, self.max_request_len, (), |s, buf, ()| {
-			api::v1::BlockRequest::decode(buf)
-				.map(move |r| Request(r, s))
-				.map_err(|decode_error| {
-					ReadOneError::Io(std::io::Error::new(std::io::ErrorKind::Other, decode_error))
-				})
-		})
+    fn upgrade_inbound(self, mut s: Negotiated<T>, _: Self::Info) -> Self::Future {
+		let future = async {
+			let vec = read_one(&mut s, self.max_request_len).await?;
+			match api::v1::BlockRequest::decode(&vec) {
+				Ok(r) => Request(r, s),
+				Err(e) => ReadOneError::Io(io::Error::new(io::ErrorKind::Other, e))
+			}
+		};
+		future.boxed()
 	}
 }
 
