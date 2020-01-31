@@ -26,11 +26,11 @@ message BlockRequest {
 		bytes number = 4;
 	}
 	// End at this block. An implementation defined maximum is used when unspecified.
-	bytes to_block = 5;
+	bytes to_block = 5; // optional
 	// Sequence direction.
 	Direction direction = 6;
 	// Maximum number of blocks to return. An implementation defined maximum is used when unspecified.
-	uint32 max_blocks = 7;
+	uint32 max_blocks = 7; // optional
 }
 
 // Response to `BlockRequest`
@@ -46,14 +46,14 @@ message BlockData {
 	// Block header hash.
 	bytes hash = 1;
 	// Block header if requested.
-	bytes header = 2;
+	bytes header = 2; // optional
 	// Block body if requested.
-	repeated bytes body = 3;
+	repeated bytes body = 3; // optional
 	// Block receipt if requested.
-	bytes receipt = 4;
+	bytes receipt = 4; // optional
 	// Block message queue if requested.
-	bytes message_queue = 5;
+	bytes message_queue = 5; // optional
 	// Justification if requested.
-	bytes justification = 6;
+	bytes justification = 6; // optional
 }
 

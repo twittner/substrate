@@ -4,6 +4,8 @@
 //! closed after we have sent the response back. Incoming requests are encoded
 //! as protocol buffers (cf. `api.v1.proto`).
 
+#![allow(unused)]
+
 use bytes::Bytes;
 use codec::{Encode, Decode};
 use crate::{
@@ -11,7 +13,7 @@ use crate::{
 	config::ProtocolId,
 	protocol::{api, message::BlockAttributes}
 };
-use futures::{future::BoxFuture, prelude::*};
+use futures::{future::BoxFuture, prelude::*, stream::FuturesUnordered};
 use libp2p::{
 	core::{
 		ConnectedPoint,
@@ -22,17 +24,15 @@ use libp2p::{
 	},
 	swarm::{NetworkBehaviour, NetworkBehaviourAction, OneShotHandler, PollParameters, SubstreamProtocol}
 };
-use log::{debug, trace};
 use prost::Message;
 use sp_runtime::{generic::BlockId, traits::{Block, Header, One, Zero}};
 use std::{
 	cmp::min,
-	collections::VecDeque,
 	io,
 	iter,
 	sync::Arc,
 	time::Duration,
-	task::Poll
+	task::{Context, Poll}
 };
 use void::{Void, unreachable};
 
@@ -48,7 +48,6 @@ pub struct Config {
 	protocol: Bytes,
 }
 
-#[allow(unused)]
 impl Config {
 	/// Create a fresh configuration with the following options:
 	///
@@ -101,20 +100,23 @@ pub struct BlockRequests<T, B: Block> {
 	config: Config,
 	/// Blockchain client.
 	chain: Arc<dyn Client<B>>,
-	/// Pending futures, sending back the block request response.
-	outgoing: VecDeque<BoxFuture<'static, ()>>,
+	/// Futures sending back the block request response.
+	outgoing: FuturesUnordered<BoxFuture<'static, ()>>,
+	/// Type witness term.
+	_marker: std::marker::PhantomData<T>
 }
 
 impl<T, B> BlockRequests<T, B>
 where
-	T: AsyncRead + AsyncWrite,
+	T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 	B: Block,
 {
 	pub fn new(cfg: Config, chain: Arc<dyn Client<B>>) -> Self {
 		BlockRequests {
 			config: cfg,
 			chain,
-			outgoing: VecDeque::new(),
+			outgoing: FuturesUnordered::new(),
+			_marker: std::marker::PhantomData
 		}
 	}
 
@@ -125,7 +127,7 @@ where
 		, request: &api::v1::BlockRequest
 		) -> Result<api::v1::BlockResponse, Error>
 	{
-		trace!("block request {} from peer {}: from block {:?} to block {:?}, max blocks {:?}",
+		log::trace!("block request {} from peer {}: from block {:?} to block {:?}, max blocks {:?}",
 			request.id,
 			peer,
 			request.from_block,
@@ -227,10 +229,10 @@ where
 
 impl<T, B> NetworkBehaviour for BlockRequests<T, B>
 where
-	T: AsyncRead + AsyncWrite,
+	T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 	B: Block
 {
-	type ProtocolsHandler = OneShotHandler<T, Protocol, DeniedUpgrade, Request<T>>;
+	type ProtocolsHandler = OneShotHandler<T, Protocol, DeniedUpgrade, Request<Negotiated<T>>>;
 	type OutEvent = Void;
 
 	fn new_handler(&mut self) -> Self::ProtocolsHandler {
@@ -251,34 +253,28 @@ where
 	fn inject_disconnected(&mut self, _peer: &PeerId, _info: ConnectedPoint) {
 	}
 
-	fn inject_node_event(&mut self, peer: PeerId, Request(request, stream): Request<T>) {
+	fn inject_node_event(&mut self, peer: PeerId, Request(request, mut stream): Request<Negotiated<T>>) {
 		match self.on_block_request(&peer, &request) {
 			Ok(res) => {
-				trace!("enqueueing block response {} for peer {} with {} blocks", res.id, peer, res.blocks.len());
+				log::trace!("enqueueing block response {} for peer {} with {} blocks", res.id, peer, res.blocks.len());
 				let mut data = Vec::with_capacity(res.encoded_len());
 				if let Err(e) = res.encode(&mut data) {
-					debug!("error encoding block response {} for peer {}: {}", res.id, peer, e)
+					log::debug!("error encoding block response {} for peer {}: {}", res.id, peer, e)
 				} else {
-					self.outgoing.push_back(write_one(stream, data))
+					let future = async move {
+						if let Err(e) = write_one(&mut stream, data).await {
+							log::debug!("error writing block response: {}", e)
+						}
+					};
+					self.outgoing.push(future.boxed())
 				}
 			}
-			Err(e) => debug!("error handling block request {} from peer {}: {}", request.id, peer, e)
+			Err(e) => log::debug!("error handling block request {} from peer {}: {}", request.id, peer, e)
 		}
 	}
 
-	fn poll(&mut self, _: &mut impl PollParameters) -> Poll<NetworkBehaviourAction<DeniedUpgrade, Void>> {
-		let mut remaining = self.outgoing.len();
-		while let Some(mut write_future) = self.outgoing.pop_front() {
-			remaining -= 1;
-			match write_future.poll() {
-				Ok(Poll::Pending) => self.outgoing.push_back(write_future),
-				Ok(Poll::Ready(())) => {}
-				Err(e) => debug!("error writing block response: {}", e)
-			}
-			if remaining == 0 {
-				break
-			}
-		}
+	fn poll(&mut self, cx: &mut Context, _: &mut impl PollParameters) -> Poll<NetworkBehaviourAction<DeniedUpgrade, Void>> {
+		while self.outgoing.poll_next_unpin(cx).is_ready() {}
 		Poll::Pending
 	}
 }
@@ -287,8 +283,8 @@ where
 ///
 /// Holds the protobuf value and the connection substream which made the
 /// request and over which to send the response.
-// TODO (after https://github.com/libp2p/rust-libp2p/pull/1226): #[derive(Debug)]
-pub struct Request<T>(api::v1::BlockRequest, Negotiated<T>);
+#[derive(Debug)]
+pub struct Request<T>(api::v1::BlockRequest, T);
 
 impl<T> From<Void> for Request<T> {
 	fn from(v: Void) -> Self {
@@ -319,17 +315,21 @@ impl UpgradeInfo for Protocol {
     }
 }
 
-impl<T: AsyncRead + AsyncWrite> InboundUpgrade<T> for Protocol {
+impl<T> InboundUpgrade<T> for Protocol
+where
+	T: AsyncRead + AsyncWrite + Unpin + Send + 'static
+{
     type Output = Request<T>;
     type Error = ReadOneError;
     type Future = BoxFuture<'static, Result<Self::Output, Self::Error>>;
 
-    fn upgrade_inbound(self, mut s: Negotiated<T>, _: Self::Info) -> Self::Future {
-		let future = async {
-			let vec = read_one(&mut s, self.max_request_len).await?;
-			match api::v1::BlockRequest::decode(&vec) {
-				Ok(r) => Request(r, s),
-				Err(e) => ReadOneError::Io(io::Error::new(io::ErrorKind::Other, e))
+    fn upgrade_inbound(self, mut s: T, _: Self::Info) -> Self::Future {
+		let future = async move {
+			let len = self.max_request_len;
+			let vec = read_one(&mut s, len).await?;
+			match api::v1::BlockRequest::decode(&vec[..]) {
+				Ok(r) => Ok(Request(r, s)),
+				Err(e) => Err(ReadOneError::Io(io::Error::new(io::ErrorKind::Other, e)))
 			}
 		};
 		future.boxed()

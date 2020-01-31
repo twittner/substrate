@@ -50,21 +50,21 @@ message RemoteCallRequest {
 // Remote call response.
 message RemoteCallResponse {
 	// Execution proof.
-	repeated bytes proof = 2;
+	bytes proof = 2;
 }
 
 // Remote storage read request.
 message RemoteReadRequest {
 	// Block at which to perform call.
 	bytes block = 2;
-	// Storage key.
-	bytes key = 3;
+	// Storage keys.
+	repeated bytes keys = 3;
 }
 
 // Remote read response.
 message RemoteReadResponse {
 	// Read proof.
-	repeated bytes proof = 2;
+	bytes proof = 2;
 }
 
 // Remote storage read child request.
@@ -73,37 +73,44 @@ message RemoteReadChildRequest {
 	bytes block = 2;
 	// Child Storage key.
 	bytes storage_key = 3;
-	// Storage key.
-	bytes key = 4;
+	// Child trie source information.
+	bytes child_info = 4;
+	/// Child type, its required to resolve `child_info`
+	/// content and choose child implementation.
+	uint32 child_type = 5;
+	// Storage keys.
+	repeated bytes keys = 6;
 }
 
 // Remote header request.
 message RemoteHeaderRequest {
 	// Block number to request header for.
-	bytes block =2;
+	bytes block = 2;
 }
 
 // Remote header response.
 message RemoteHeaderResponse {
 	// Header. None if proof generation has failed (e.g. header is unknown).
-	bytes header = 2;
+	bytes header = 2; // optional
 	// Header proof.
-	repeated bytes proof = 3;
+	bytes proof = 3;
 }
 
 /// Remote changes request.
 message RemoteChangesRequest {
-	/// Hash of the first block of the range (including first) where changes are requested.
+	// Hash of the first block of the range (including first) where changes are requested.
 	bytes first = 2;
-	/// Hash of the last block of the range (including last) where changes are requested.
+	// Hash of the last block of the range (including last) where changes are requested.
 	bytes last = 3;
-	/// Hash of the first block for which the requester has the changes trie root. All other
-	/// affected roots must be proved.
+	// Hash of the first block for which the requester has the changes trie root. All other
+	// affected roots must be proved.
 	bytes min = 4;
-	/// Hash of the last block that we can use when querying changes.
+	// Hash of the last block that we can use when querying changes.
 	bytes max = 5;
-	/// Storage key which changes are requested.
-	bytes key = 6;
+	// Storage child node key which changes are requested.
+	bytes storage_key = 6; // optional
+	// Storage key which changes are requested.
+	bytes key = 7;
 }
 
 // Remote changes response.
@@ -116,6 +123,6 @@ message RemoteChangesResponse {
 	// Changes tries roots missing on the requester' node.
 	repeated Pair roots = 4;
 	// Missing changes tries roots proof.
-	repeated bytes roots_proof = 5;
+	bytes roots_proof = 5;
 }
 

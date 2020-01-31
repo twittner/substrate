@@ -19,8 +19,7 @@ use crate::{
 	Event, protocol::event::DhtEvent
 };
 use crate::{ExHashT, specialization::NetworkSpecialization};
-use crate::protocol::{self, light_client_handler, CustomMessageOutcome, Protocol};
-use futures::prelude::*;
+use crate::protocol::{self, CustomMessageOutcome, Protocol};
 use libp2p::NetworkBehaviour;
 use libp2p::core::{Multiaddr, PeerId, PublicKey};
 use libp2p::kad::record;
@@ -46,7 +45,7 @@ pub struct Behaviour<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> {
 	/// Block request handling.
 	block_requests: protocol::BlockRequests<Substream<StreamMuxerBox>, B>,
 	/// Light client request handling.
-	light_client_handler: protocol::LightClientHandler<Substream<StreamMuxerBox>, B>,
+	//light_client_handler: protocol::LightClientHandler<Substream<StreamMuxerBox>, B>,
 
 	/// Queue of events to produce for the outside.
 	#[behaviour(ignore)]
@@ -71,7 +70,7 @@ impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> Behaviour<B, S, H> {
 		enable_mdns: bool,
 		allow_private_ipv4: bool,
 		block_requests: protocol::BlockRequests<Substream<StreamMuxerBox>, B>,
-		light_client_handler: protocol::LightClientHandler<Substream<StreamMuxerBox>, B>
+		//light_client_handler: protocol::LightClientHandler<Substream<StreamMuxerBox>, B>
 	) -> Self {
 		Behaviour {
 			substrate,
@@ -83,7 +82,7 @@ impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> Behaviour<B, S, H> {
 				allow_private_ipv4
 			).await,
 			block_requests,
-			light_client_handler,
+			//light_client_handler,
 			events: Vec::new()
 		}
 	}
@@ -127,10 +126,10 @@ impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> Behaviour<B, S, H> {
 		self.discovery.put_value(key, value);
 	}
 
-	/// Issue a light client request.
-	pub fn light_client_request(&mut self, r: light_client_handler::Request<B>) -> Result<(), light_client_handler::Error> {
-		self.light_client_handler.request(r)
-	}
+//	/// Issue a light client request.
+//	pub fn light_client_request(&mut self, r: light_client_handler::Request<B>) -> Result<(), light_client_handler::Error> {
+//		self.light_client_handler.request(r)
+//	}
 }
 
 impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> NetworkBehaviourEventProcess<void::Void> for
