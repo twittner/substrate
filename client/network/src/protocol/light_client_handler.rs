@@ -118,6 +118,7 @@ pub enum Error {
 	/// The response type does not correspond to the issued request.
 	#[error("unexpected response")]
 	UnexpectedResponse,
+	/// A bad request has been received.
 	#[error("bad request: {0}")]
 	BadRequest(&'static str),
 	/// The chain client errored.
@@ -1084,7 +1085,7 @@ mod tests {
 		config::ProtocolId,
 		protocol::{api, light_dispatch::tests::{DummyFetchChecker, dummy_header}}
 	};
-	use futures::{prelude::*, channel::oneshot};
+	use futures::{channel::oneshot, executor, prelude::*};
 	use libp2p::{
 		PeerId,
 		Multiaddr,
@@ -1100,7 +1101,8 @@ mod tests {
 		yamux
 	};
 	use sc_client::light::fetcher;
-	use std::{collections::HashSet, io, iter::{self, FromIterator}, sync::Arc};
+	use sp_blockchain::{Error as ClientError};
+	use std::{collections::HashSet, io, iter::{self, FromIterator}, sync::Arc, task::{Context, Poll}};
 	use super::{Event, LightClientHandler, Request, OutboundProtocol, PeerStatus};
 	use sp_test_primitives::{changes_trie_config, Block};
 	use void::Void;
@@ -1109,25 +1111,19 @@ mod tests {
 	type Swarm = libp2p::swarm::Swarm<Boxed<(PeerId, StreamMuxerBox), io::Error>, Handler>;
 
 	fn make_swarm(ok: bool, ps: sc_peerset::PeersetHandle, cf: super::Config) -> Swarm {
+		let client = Arc::new(substrate_test_runtime_client::new());
+		let checker = Arc::new(DummyFetchChecker { ok });
 		let id_key = identity::Keypair::generate_ed25519();
 		let dh_key = Keypair::<X25519>::new().into_authentic(&id_key).unwrap();
 		let local_peer = id_key.public().into_peer_id();
 		let transport = MemoryTransport::default()
-			.with_upgrade(NoiseConfig::xx(dh_key))
-			.and_then(move |(remote, stream), endpoint| {
-				let peer =
-					if let noise::RemoteIdentity::IdentityKey(k) = remote {
-						k.into_peer_id()
-					} else {
-						panic!("Expected IdentityKey")
-					};
-				upgrade::apply(stream, yamux::Config::default(), endpoint).map(|m| (peer, StreamMuxerBox::new(m)))
-			})
+			.upgrade(upgrade::Version::V1)
+			.authenticate(NoiseConfig::xx(dh_key).into_authenticated())
+			.multiplex(yamux::Config::default())
+			.map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)))
 			.map_err(|e| io::Error::new(io::ErrorKind::Other, e))
 			.boxed();
-		let client = Arc::new(test_client::new());
-		let checker = Arc::new(DummyFetchChecker { ok });
-		libp2p::swarm::Swarm::new(transport, LightClientHandler::new(cf, client, checker, ps), local_peer)
+		Swarm::new(transport, LightClientHandler::new(cf, client, checker, ps), local_peer)
 	}
 
 	fn make_config() -> super::Config {
@@ -1158,24 +1154,24 @@ mod tests {
 		}
 	}
 
-	fn peerset() -> (peerset::Peerset, peerset::PeersetHandle) {
-		let cfg = peerset::PeersetConfig {
+	fn peerset() -> (sc_peerset::Peerset, sc_peerset::PeersetHandle) {
+		let cfg = sc_peerset::PeersetConfig {
 			in_peers: 128,
 			out_peers: 128,
 			bootnodes: Vec::new(),
 			reserved_only: false,
 			reserved_nodes: Vec::new(),
 		};
-		peerset::Peerset::from_config(cfg)
+		sc_peerset::Peerset::from_config(cfg)
 	}
 
 	fn make_behaviour
 		( ok: bool
-		, ps: peerset::PeersetHandle
+		, ps: sc_peerset::PeersetHandle
 		, cf: super::Config
-		) -> LightClientHandler<io::Cursor<Vec<u8>>, Block>
+		) -> LightClientHandler<futures::io::Cursor<Vec<u8>>, Block>
 	{
-		let client = Arc::new(test_client::new());
+		let client = Arc::new(substrate_test_runtime_client::new());
 		let checker = Arc::new(DummyFetchChecker { ok });
 		LightClientHandler::new(cf, client, checker, ps)
 	}
@@ -1184,10 +1180,11 @@ mod tests {
 		ConnectedPoint::Dialer { address: Multiaddr::empty() }
 	}
 
-	fn poll<T>(b: &mut LightClientHandler<T, Block>) -> Async<NetworkBehaviourAction<OutboundProtocol, Void>>
-		where T: AsyncRead + AsyncWrite
+	fn poll<T>(b: &mut LightClientHandler<T, Block>) -> Poll<NetworkBehaviourAction<OutboundProtocol, Void>>
+	where
+		T: AsyncRead + AsyncWrite
 	{
-		b.poll(&mut EmptyPollParams(PeerId::random()))
+		future::poll_fn(|cx| b.poll(cx, &mut EmptyPollParams(PeerId::random())))
 	}
 
 	#[test]
@@ -1229,7 +1226,7 @@ mod tests {
 			call_data: vec![],
 			retry_count: Some(1),
 		};
-		behaviour.request(Request::Call(request, chan.0)).unwrap();
+		behaviour.request(Request::Call { request, sender: chan.0 }).unwrap();
 		assert_eq!(1, behaviour.pending_requests.len());
 
 		// The behaviour should now attempt to send the request.
@@ -1283,7 +1280,7 @@ mod tests {
 			call_data: vec![],
 			retry_count: Some(1),
 		};
-		behaviour.request(Request::Call(request, chan.0)).unwrap();
+		behaviour.request(Request::Call { request, sender: chan.0 }).unwrap();
 
 		assert_eq!(1, behaviour.pending_requests.len());
 		assert_eq!(0, behaviour.outstanding.len());
@@ -1331,7 +1328,7 @@ mod tests {
 			call_data: vec![],
 			retry_count: Some(1),
 		};
-		behaviour.request(Request::Call(request, chan.0)).unwrap();
+		behaviour.request(Request::Call { request, sender: chan.0 }).unwrap();
 
 		assert_eq!(1, behaviour.pending_requests.len());
 		assert_eq!(0, behaviour.outstanding.len());
@@ -1404,7 +1401,7 @@ mod tests {
 			call_data: vec![],
 			retry_count: Some(1),
 		};
-		behaviour.request(Request::Call(request, chan.0)).unwrap();
+		behaviour.request(Request::Call { request, sender: chan.0 }).unwrap();
 
 		assert_eq!(1, behaviour.pending_requests.len());
 		assert_eq!(0, behaviour.outstanding.len());
@@ -1456,7 +1453,7 @@ mod tests {
 			call_data: vec![],
 			retry_count: Some(3), // Attempt up to three retries.
 		};
-		behaviour.request(Request::Call(request, chan.0)).unwrap();
+		behaviour.request(Request::Call { request, sender: chan.0 }).unwrap();
 
 		assert_eq!(1, behaviour.pending_requests.len());
 		assert_eq!(0, behaviour.outstanding.len());
@@ -1503,7 +1500,7 @@ mod tests {
 		assert_eq!(1, behaviour.peers.len());
 
 		let response = match request {
-			Request::Header(..) => {
+			Request::Header{..} => {
 				let r = api::v1::light::RemoteHeaderResponse {
 					header: dummy_header().encode(),
 					proof: Vec::new(),
@@ -1513,28 +1510,28 @@ mod tests {
 					response: Some(api::v1::light::response::Response::RemoteHeaderResponse(r)),
 				}
 			}
-			Request::Read(..) => {
+			Request::Read{..} => {
 				let r = api::v1::light::RemoteReadResponse { proof: Vec::new() };
 				api::v1::light::Response {
 					id: 1,
 					response: Some(api::v1::light::response::Response::RemoteReadResponse(r)),
 				}
 			}
-			Request::ReadChild(..) => {
+			Request::ReadChild{..} => {
 				let r = api::v1::light::RemoteReadResponse { proof: Vec::new() };
 				api::v1::light::Response {
 					id: 1,
 					response: Some(api::v1::light::response::Response::RemoteReadResponse(r)),
 				}
 			}
-			Request::Call(..) => {
+			Request::Call{..} => {
 				let r = api::v1::light::RemoteCallResponse { proof: Vec::new() };
 				api::v1::light::Response {
 					id: 1,
 					response: Some(api::v1::light::response::Response::RemoteCallResponse(r)),
 				}
 			}
-			Request::Changes(..) => {
+			Request::Changes{..} => {
 				let r = api::v1::light::RemoteChangesResponse {
 					max: iter::repeat(1).take(32).collect(),
 					proof: Vec::new(),
@@ -1575,7 +1572,7 @@ mod tests {
 			call_data: vec![],
 			retry_count: None,
 		};
-		issue_request(Request::Call(request, chan.0));
+		issue_request(Request::Call { request, sender: chan.0 });
 		assert_matches!(chan.1.try_recv(), Ok(Some(Ok(_))))
 	}
 
@@ -1588,7 +1585,7 @@ mod tests {
 			keys: vec![b":key".to_vec()],
 			retry_count: None,
 		};
-		issue_request(Request::Read(request, chan.0));
+		issue_request(Request::Read { request, sender: chan.0 });
 		assert_matches!(chan.1.try_recv(), Ok(Some(Ok(_))))
 	}
 
@@ -1602,7 +1599,7 @@ mod tests {
 			keys: vec![b":key".to_vec()],
 			retry_count: None,
 		};
-		issue_request(Request::ReadChild(request, chan.0));
+		issue_request(Request::ReadChild { request, sender: chan.0 });
 		assert_matches!(chan.1.try_recv(), Ok(Some(Ok(_))))
 	}
 
@@ -1614,7 +1611,7 @@ mod tests {
 			block: 1,
 			retry_count: None,
 		};
-		issue_request(Request::Header(request, chan.0));
+		issue_request(Request::Header { request, sender: chan.0 });
 		assert_matches!(chan.1.try_recv(), Ok(Some(Ok(_))))
 	}
 
@@ -1631,11 +1628,11 @@ mod tests {
 			storage_key: None,
 			retry_count: None,
 		};
-		issue_request(Request::Changes(request, chan.0));
+		issue_request(Request::Changes { request, sender: chan.0 });
 		assert_matches!(chan.1.try_recv(), Ok(Some(Ok(_))))
 	}
 
-	fn send_receive(runtime: &mut tokio::runtime::Runtime, request: Request<Block>) {
+	fn send_receive(request: Request<Block>) {
 		// We start a swarm on the listening side which awaits incoming requests and answers them:
 		let local_pset = peerset();
 		let local_listen_addr: libp2p::Multiaddr = libp2p::multiaddr::Protocol::Memory(rand::random()).into();
@@ -1650,10 +1647,11 @@ mod tests {
 		remote_swarm.request(request).unwrap();
 		Swarm::dial_addr(&mut remote_swarm, local_listen_addr).unwrap();
 
-		runtime.spawn(local_swarm.for_each(|_| Ok(()))
-			.join(remote_swarm.for_each(|_| Ok(())))
+		let future = local_swarm.for_each(|_| Ok(())).join(remote_swarm.for_each(|_| Ok(())))
 			.map(|_| ())
-			.map_err(|e| panic!("{}", e)));
+			.map_err(|e| panic!("{}", e));
+
+		executor::block_on(future)
 	}
 
 	#[test]
@@ -1666,8 +1664,7 @@ mod tests {
 			call_data: vec![],
 			retry_count: None,
 		};
-		let mut runtime = tokio::runtime::Runtime::new().expect("new tokio runtime");
-		send_receive(&mut runtime, Request::Call(request, chan.0));
+		send_receive(Request::Call { request, sender: chan.0 });
 		assert_eq!(vec![42], chan.1.wait().unwrap().unwrap());
 		//              ^--- from `DummyFetchChecker::check_execution_proof`
 	}
@@ -1681,8 +1678,7 @@ mod tests {
 			keys: vec![b":key".to_vec()],
 			retry_count: None
 		};
-		let mut runtime = tokio::runtime::Runtime::new().expect("new tokio runtime");
-		send_receive(&mut runtime, Request::Read(request, chan.0));
+		send_receive(Request::Read { request, sender: chan.0 });
 		assert_eq!(Some(vec![42]), chan.1.wait().unwrap().unwrap().remove(&b":key"[..]).unwrap());
 		//                   ^--- from `DummyFetchChecker::check_read_proof`
 	}
@@ -1697,8 +1693,7 @@ mod tests {
 			keys: vec![b":key".to_vec()],
 			retry_count: None,
 		};
-		let mut runtime = tokio::runtime::Runtime::new().expect("new tokio runtime");
-		send_receive(&mut runtime, Request::ReadChild(request, chan.0));
+		send_receive(Request::ReadChild { request, sender: chan.0 });
 		assert_eq!(Some(vec![42]), chan.1.wait().unwrap().unwrap().remove(&b":key"[..]).unwrap());
 		//                   ^--- from `DummyFetchChecker::check_read_child_proof`
 	}
@@ -1712,8 +1707,7 @@ mod tests {
 			block: 1,
 			retry_count: None,
 		};
-		let mut runtime = tokio::runtime::Runtime::new().expect("new tokio runtime");
-		send_receive(&mut runtime, Request::Header(request, chan.0));
+		send_receive(Request::Header { request, sender: chan.0 });
 		// The remote does not know block 1:
 		assert_matches!(chan.1.wait().unwrap(), Err(ClientError::RemoteFetchFailed));
 	}
@@ -1731,8 +1725,7 @@ mod tests {
 			storage_key: None,
 			retry_count: None,
 		};
-		let mut runtime = tokio::runtime::Runtime::new().expect("new tokio runtime");
-		send_receive(&mut runtime, Request::Changes(request, chan.0));
+		send_receive(Request::Changes { request, sender: chan.0 });
 		assert_eq!(vec![(100, 2)], chan.1.wait().unwrap().unwrap());
 		//              ^--- from `DummyFetchChecker::check_changes_proof`
 	}
