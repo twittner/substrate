@@ -170,7 +170,7 @@ enum Reply<B: Block> {
 	VecU8(Vec<u8>),
 	VecNumberU32(Vec<(<B::Header as Header>::Number, u32)>),
 	MapVecU8OptVecU8(HashMap<Vec<u8>, Option<Vec<u8>>>),
-	Header(B::Header),
+	Header(B::Header)
 }
 
 /// Augments a light client request with metadata.
@@ -183,7 +183,7 @@ struct RequestWrapper<B: Block, P> {
 	/// The actual request.
 	request: Request<B>,
 	/// Peer information, e.g. `PeerId`.
-	peer: P,
+	peer: P
 }
 
 /// Information we have about some peer.
@@ -403,7 +403,11 @@ where
 		, request: &api::v1::light::RemoteCallRequest
 		) -> Result<api::v1::light::Response, Error>
 	{
-		log::trace!("remote call request {} from {} ({} at {:?})", request_id, peer, request.method, request.block);
+		log::trace!("remote call request {} from {} ({} at {:?})",
+			request_id,
+			peer,
+			request.method,
+			request.block);
 
 		let block = Decode::decode(&mut request.block.as_ref())?;
 
@@ -852,7 +856,8 @@ where
 		for id in expired {
 			if let Some(rw) = self.outstanding.remove(&id) {
 				self.remove_peer(&rw.peer);
-				self.peerset.report_peer(rw.peer.clone(), ReputationChange::new(TIMEOUT_REPUTATION_CHANGE, "light request timeout"));
+				self.peerset.report_peer(rw.peer.clone(),
+					ReputationChange::new(TIMEOUT_REPUTATION_CHANGE, "light request timeout"));
 				if rw.retries == 0 {
 					send_reply(Err(ClientError::RemoteFetchFailed), rw.request);
 					continue
@@ -1082,10 +1087,11 @@ mod tests {
 	use assert_matches::assert_matches;
 	use codec::Encode;
 	use crate::{
+		chain::Client,
 		config::ProtocolId,
 		protocol::{api, light_dispatch::tests::{DummyFetchChecker, dummy_header}}
 	};
-	use futures::{channel::oneshot, executor, prelude::*};
+	use futures::{channel::oneshot, executor::block_on, prelude::*};
 	use libp2p::{
 		PeerId,
 		Multiaddr,
@@ -1102,10 +1108,20 @@ mod tests {
 	};
 	use sc_client::light::fetcher;
 	use sp_blockchain::{Error as ClientError};
-	use std::{collections::HashSet, io, iter::{self, FromIterator}, sync::Arc, task::{Context, Poll}};
+	use sp_core::storage::ChildInfo;
+	use std::{
+		collections::HashSet,
+		io,
+		iter::{self, FromIterator},
+		pin::Pin,
+		sync::Arc,
+		task::{Context, Poll}
+	};
 	use super::{Event, LightClientHandler, Request, OutboundProtocol, PeerStatus};
-	use sp_test_primitives::{changes_trie_config, Block};
+	use sp_test_primitives::Block;
 	use void::Void;
+
+	const CHILD_INFO: ChildInfo<'static> = ChildInfo::new_default(b"foobarbaz");
 
 	type Handler = LightClientHandler<SubstreamRef<Arc<StreamMuxerBox>>, Block>;
 	type Swarm = libp2p::swarm::Swarm<Boxed<(PeerId, StreamMuxerBox), io::Error>, Handler>;
@@ -1123,7 +1139,7 @@ mod tests {
 			.map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)))
 			.map_err(|e| io::Error::new(io::ErrorKind::Other, e))
 			.boxed();
-		Swarm::new(transport, LightClientHandler::new(cf, client, checker, ps), local_peer)
+		Swarm::new(transport, LightClientHandler::new(cf, todo!(), checker, ps), local_peer)
 	}
 
 	fn make_config() -> super::Config {
@@ -1173,18 +1189,22 @@ mod tests {
 	{
 		let client = Arc::new(substrate_test_runtime_client::new());
 		let checker = Arc::new(DummyFetchChecker { ok });
-		LightClientHandler::new(cf, client, checker, ps)
+		LightClientHandler::new(cf, todo!(), checker, ps)
 	}
 
 	fn empty_dialer() -> ConnectedPoint {
 		ConnectedPoint::Dialer { address: Multiaddr::empty() }
 	}
 
-	fn poll<T>(b: &mut LightClientHandler<T, Block>) -> Poll<NetworkBehaviourAction<OutboundProtocol, Void>>
+	fn poll<T>(mut b: &mut LightClientHandler<T, Block>) -> Poll<NetworkBehaviourAction<OutboundProtocol, Void>>
 	where
-		T: AsyncRead + AsyncWrite
+		T: AsyncRead + AsyncWrite + Unpin + Send + 'static
 	{
-		future::poll_fn(|cx| b.poll(cx, &mut EmptyPollParams(PeerId::random())))
+		let mut p = EmptyPollParams(PeerId::random());
+		match future::poll_fn(|cx| Pin::new(&mut b).poll(cx, &mut p)).now_or_never() {
+			Some(a) => Poll::Ready(a),
+			None    => Poll::Pending
+		}
 	}
 
 	#[test]
@@ -1591,12 +1611,15 @@ mod tests {
 
 	#[test]
 	fn receives_remote_read_child_response() {
+		let info = CHILD_INFO.info();
 		let mut chan = oneshot::channel();
 		let request = fetcher::RemoteReadChildRequest {
 			header: dummy_header(),
 			block: Default::default(),
 			storage_key: b":child_storage:sub".to_vec(),
 			keys: vec![b":key".to_vec()],
+			child_info: info.0.to_vec(),
+			child_type: info.1,
 			retry_count: None,
 		};
 		issue_request(Request::ReadChild { request, sender: chan.0 });
@@ -1619,7 +1642,11 @@ mod tests {
 	fn receives_remote_changes_response() {
 		let mut chan = oneshot::channel();
 		let request = fetcher::RemoteChangesRequest {
-			changes_trie_config: changes_trie_config(),
+			changes_trie_configs: vec![sp_core::ChangesTrieConfigurationRange {
+				zero: (0, Default::default()),
+				end: None,
+				config: Some(sp_core::ChangesTrieConfiguration::new(4, 2)),
+			}],
 			first_block: (1, Default::default()),
 			last_block: (100, Default::default()),
 			max_block: (100, Default::default()),
@@ -1647,11 +1674,13 @@ mod tests {
 		remote_swarm.request(request).unwrap();
 		Swarm::dial_addr(&mut remote_swarm, local_listen_addr).unwrap();
 
-		let future = local_swarm.for_each(|_| Ok(())).join(remote_swarm.for_each(|_| Ok(())))
-			.map(|_| ())
-			.map_err(|e| panic!("{}", e));
+		let future = {
+			let a = local_swarm.for_each(|_| future::ready(()));
+			let b = remote_swarm.for_each(|_| future::ready(()));
+			future::join(a, b).map(|_| ())
+		};
 
-		executor::block_on(future)
+		block_on(future)
 	}
 
 	#[test]
@@ -1665,7 +1694,7 @@ mod tests {
 			retry_count: None,
 		};
 		send_receive(Request::Call { request, sender: chan.0 });
-		assert_eq!(vec![42], chan.1.wait().unwrap().unwrap());
+		assert_eq!(vec![42], block_on(chan.1).unwrap().unwrap());
 		//              ^--- from `DummyFetchChecker::check_execution_proof`
 	}
 
@@ -1679,22 +1708,25 @@ mod tests {
 			retry_count: None
 		};
 		send_receive(Request::Read { request, sender: chan.0 });
-		assert_eq!(Some(vec![42]), chan.1.wait().unwrap().unwrap().remove(&b":key"[..]).unwrap());
+		assert_eq!(Some(vec![42]), block_on(chan.1).unwrap().unwrap().remove(&b":key"[..]).unwrap());
 		//                   ^--- from `DummyFetchChecker::check_read_proof`
 	}
 
 	#[test]
 	fn send_receive_read_child() {
+		let info = CHILD_INFO.info();
 		let chan = oneshot::channel();
 		let request = fetcher::RemoteReadChildRequest {
 			header: dummy_header(),
 			block: Default::default(),
 			storage_key: b":child_storage:sub".to_vec(),
 			keys: vec![b":key".to_vec()],
+			child_info: info.0.to_vec(),
+			child_type: info.1,
 			retry_count: None,
 		};
 		send_receive(Request::ReadChild { request, sender: chan.0 });
-		assert_eq!(Some(vec![42]), chan.1.wait().unwrap().unwrap().remove(&b":key"[..]).unwrap());
+		assert_eq!(Some(vec![42]), block_on(chan.1).unwrap().unwrap().remove(&b":key"[..]).unwrap());
 		//                   ^--- from `DummyFetchChecker::check_read_child_proof`
 	}
 
@@ -1709,14 +1741,18 @@ mod tests {
 		};
 		send_receive(Request::Header { request, sender: chan.0 });
 		// The remote does not know block 1:
-		assert_matches!(chan.1.wait().unwrap(), Err(ClientError::RemoteFetchFailed));
+		assert_matches!(block_on(chan.1).unwrap(), Err(ClientError::RemoteFetchFailed));
 	}
 
 	#[test]
 	fn send_receive_changes() {
 		let chan = oneshot::channel();
 		let request = fetcher::RemoteChangesRequest {
-			changes_trie_config: changes_trie_config(),
+			changes_trie_configs: vec![sp_core::ChangesTrieConfigurationRange {
+				zero: (0, Default::default()),
+				end: None,
+				config: Some(sp_core::ChangesTrieConfiguration::new(4, 2)),
+			}],
 			first_block: (1, Default::default()),
 			last_block: (100, Default::default()),
 			max_block: (100, Default::default()),
@@ -1726,7 +1762,7 @@ mod tests {
 			retry_count: None,
 		};
 		send_receive(Request::Changes { request, sender: chan.0 });
-		assert_eq!(vec![(100, 2)], chan.1.wait().unwrap().unwrap());
+		assert_eq!(vec![(100, 2)], block_on(chan.1).unwrap().unwrap());
 		//              ^--- from `DummyFetchChecker::check_changes_proof`
 	}
 }

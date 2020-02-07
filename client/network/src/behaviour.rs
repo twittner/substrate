@@ -45,8 +45,7 @@ pub struct Behaviour<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> {
 	/// Block request handling.
 	block_requests: protocol::BlockRequests<Substream<StreamMuxerBox>, B>,
 	/// Light client request handling.
-	//light_client_handler: protocol::LightClientHandler<Substream<StreamMuxerBox>, B>,
-
+	light_client_handler: protocol::LightClientHandler<Substream<StreamMuxerBox>, B>,
 	/// Queue of events to produce for the outside.
 	#[behaviour(ignore)]
 	events: Vec<BehaviourOut<B>>,
@@ -70,7 +69,7 @@ impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> Behaviour<B, S, H> {
 		enable_mdns: bool,
 		allow_private_ipv4: bool,
 		block_requests: protocol::BlockRequests<Substream<StreamMuxerBox>, B>,
-		//light_client_handler: protocol::LightClientHandler<Substream<StreamMuxerBox>, B>
+		light_client_handler: protocol::LightClientHandler<Substream<StreamMuxerBox>, B>
 	) -> Self {
 		Behaviour {
 			substrate,
@@ -82,7 +81,7 @@ impl<B: BlockT, S: NetworkSpecialization<B>, H: ExHashT> Behaviour<B, S, H> {
 				allow_private_ipv4
 			).await,
 			block_requests,
-			//light_client_handler,
+			light_client_handler,
 			events: Vec::new()
 		}
 	}

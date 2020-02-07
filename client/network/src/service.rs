@@ -226,10 +226,10 @@ impl<B: BlockT + 'static, S: NetworkSpecialization<B>, H: ExHashT> NetworkWorker
 				let config = protocol::block_requests::Config::new(&params.protocol_id);
 				protocol::BlockRequests::new(config, params.chain.clone())
 			};
-			//let light_client_handler = {
-			//	let config = protocol::light_client_handler::Config::new(&params.protocol_id);
-			//	protocol::LightClientHandler::new(config, params.chain, checker, peerset_handle.clone())
-			//};
+			let light_client_handler = {
+				let config = protocol::light_client_handler::Config::new(&params.protocol_id);
+				protocol::LightClientHandler::new(config, params.chain, checker, peerset_handle.clone())
+			};
 			let behaviour = futures::executor::block_on(Behaviour::new(
 				protocol,
 				user_agent,
@@ -244,7 +244,7 @@ impl<B: BlockT + 'static, S: NetworkSpecialization<B>, H: ExHashT> NetworkWorker
 					TransportConfig::Normal { allow_private_ipv4, .. } => allow_private_ipv4,
 				},
 				block_requests,
-				//light_client_handler
+				light_client_handler
 			));
 			let (transport, bandwidth) = {
 				let (config_mem, config_wasm) = match params.network_config.transport {
