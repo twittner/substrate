@@ -678,6 +678,7 @@ where
 		match event {
 			// An incoming request from remote has been received.
 			Event::Request(request, mut stream) => {
+				log::trace!("incoming request {} from {}", peer, request.id);
 				let result = match &request.request {
 					Some(api::v1::light::request::Request::RemoteCallRequest(r)) =>
 						self.on_remote_call_request(&peer, request.id, r),
@@ -793,7 +794,7 @@ where
 
 	fn poll(&mut self, cx: &mut Context, _: &mut impl PollParameters) -> Poll<NetworkBehaviourAction<OutboundProtocol, Void>> {
 		// Process response sending futures.
-		while self.responses.poll_next_unpin(cx).is_ready() {}
+		while let Poll::Ready(Some(_)) = self.responses.poll_next_unpin(cx) {}
 
 		// If we have a pending request to send, try to find an available peer and send it.
 		let now = Instant::now();
@@ -823,6 +824,7 @@ where
 					log::debug!("failed to serialise request {}: {}", id, e);
 					send_reply(Err(ClientError::RemoteFetchFailed), request.request)
 				} else {
+					log::trace!("sending request {} to peer {}", id, peer);
 					let protocol = OutboundProtocol {
 						request: buf,
 						max_data_size: self.config.max_data_size,
@@ -1084,6 +1086,7 @@ fn fmt_keys(first: Option<&Vec<u8>>, last: Option<&Vec<u8>>) -> String {
 
 #[cfg(test)]
 mod tests {
+	use async_std::task;
 	use assert_matches::assert_matches;
 	use codec::Encode;
 	use crate::{
@@ -1091,7 +1094,7 @@ mod tests {
 		config::ProtocolId,
 		protocol::{api, light_dispatch::tests::{DummyFetchChecker, dummy_header}}
 	};
-	use futures::{channel::oneshot, executor::block_on, prelude::*};
+	use futures::{channel::oneshot, prelude::*};
 	use libp2p::{
 		PeerId,
 		Multiaddr,
@@ -1106,6 +1109,7 @@ mod tests {
 		swarm::{NetworkBehaviour, NetworkBehaviourAction, PollParameters},
 		yamux
 	};
+	use sc_client_api::StorageProof;
 	use sc_client::light::fetcher;
 	use sp_blockchain::{Error as ClientError};
 	use sp_core::storage::ChildInfo;
@@ -1117,18 +1121,23 @@ mod tests {
 		sync::Arc,
 		task::{Context, Poll}
 	};
+	use sp_runtime::{generic::Header, traits::BlakeTwo256};
 	use super::{Event, LightClientHandler, Request, OutboundProtocol, PeerStatus};
-	use sp_test_primitives::Block;
 	use void::Void;
 
 	const CHILD_INFO: ChildInfo<'static> = ChildInfo::new_default(b"foobarbaz");
 
+	type Block = sp_runtime::generic::Block<Header<u64, BlakeTwo256>, substrate_test_runtime::Extrinsic>;
 	type Handler = LightClientHandler<SubstreamRef<Arc<StreamMuxerBox>>, Block>;
 	type Swarm = libp2p::swarm::Swarm<Boxed<(PeerId, StreamMuxerBox), io::Error>, Handler>;
 
+	fn empty_proof() -> Vec<u8> {
+		StorageProof::empty().encode()
+	}
+
 	fn make_swarm(ok: bool, ps: sc_peerset::PeersetHandle, cf: super::Config) -> Swarm {
 		let client = Arc::new(substrate_test_runtime_client::new());
-		let checker = Arc::new(DummyFetchChecker { ok });
+		let checker = Arc::new(DummyFetchChecker::new(ok));
 		let id_key = identity::Keypair::generate_ed25519();
 		let dh_key = Keypair::<X25519>::new().into_authentic(&id_key).unwrap();
 		let local_peer = id_key.public().into_peer_id();
@@ -1139,7 +1148,7 @@ mod tests {
 			.map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)))
 			.map_err(|e| io::Error::new(io::ErrorKind::Other, e))
 			.boxed();
-		Swarm::new(transport, LightClientHandler::new(cf, todo!(), checker, ps), local_peer)
+		Swarm::new(transport, LightClientHandler::new(cf, client, checker, ps), local_peer)
 	}
 
 	fn make_config() -> super::Config {
@@ -1188,8 +1197,8 @@ mod tests {
 		) -> LightClientHandler<futures::io::Cursor<Vec<u8>>, Block>
 	{
 		let client = Arc::new(substrate_test_runtime_client::new());
-		let checker = Arc::new(DummyFetchChecker { ok });
-		LightClientHandler::new(cf, todo!(), checker, ps)
+		let checker = Arc::new(DummyFetchChecker::new(ok));
+		LightClientHandler::new(cf, client, checker, ps)
 	}
 
 	fn empty_dialer() -> ConnectedPoint {
@@ -1310,7 +1319,7 @@ mod tests {
 
 		// Construct response with bogus ID
 		let response = {
-			let r = api::v1::light::RemoteCallResponse { proof: Vec::new() };
+			let r = api::v1::light::RemoteCallResponse { proof: empty_proof() };
 			api::v1::light::Response {
 				id: 2365789,
 				response: Some(api::v1::light::response::Response::RemoteCallResponse(r)),
@@ -1359,7 +1368,7 @@ mod tests {
 		let request_id = *behaviour.outstanding.keys().next().unwrap();
 
 		let response = {
-			let r = api::v1::light::RemoteCallResponse { proof: Vec::new() };
+			let r = api::v1::light::RemoteCallResponse { proof: empty_proof() };
 			api::v1::light::Response {
 				id: request_id,
 				response: Some(api::v1::light::response::Response::RemoteCallResponse(r)),
@@ -1389,7 +1398,7 @@ mod tests {
 
 		// Some unsolicited response
 		let response = {
-			let r = api::v1::light::RemoteCallResponse { proof: Vec::new() };
+			let r = api::v1::light::RemoteCallResponse { proof: empty_proof() };
 			api::v1::light::Response {
 				id: 2347895932,
 				response: Some(api::v1::light::response::Response::RemoteCallResponse(r)),
@@ -1432,7 +1441,7 @@ mod tests {
 		let request_id = *behaviour.outstanding.keys().next().unwrap();
 
 		let response = {
-			let r = api::v1::light::RemoteReadResponse { proof: Vec::new() }; // Not a RemoteCallResponse!
+			let r = api::v1::light::RemoteReadResponse { proof: empty_proof() }; // Not a RemoteCallResponse!
 			api::v1::light::Response {
 				id: request_id,
 				response: Some(api::v1::light::response::Response::RemoteReadResponse(r)),
@@ -1486,7 +1495,7 @@ mod tests {
 			let request_id = *behaviour.outstanding.keys().next().unwrap();
 			let responding_peer = behaviour.outstanding.values().next().unwrap().peer.clone();
 			let response = {
-				let r = api::v1::light::RemoteCallResponse { proof: Vec::new() };
+				let r = api::v1::light::RemoteCallResponse { proof: empty_proof() };
 				api::v1::light::Response {
 					id: request_id,
 					response: Some(api::v1::light::response::Response::RemoteCallResponse(r))
@@ -1500,7 +1509,7 @@ mod tests {
 		let request_id = *behaviour.outstanding.keys().next().unwrap();
 		let responding_peer = behaviour.outstanding.values().next().unwrap().peer.clone();
 		let response = {
-			let r = api::v1::light::RemoteCallResponse { proof: Vec::new() };
+			let r = api::v1::light::RemoteCallResponse { proof: empty_proof() };
 			api::v1::light::Response {
 				id: request_id,
 				response: Some(api::v1::light::response::Response::RemoteCallResponse(r)),
@@ -1523,7 +1532,7 @@ mod tests {
 			Request::Header{..} => {
 				let r = api::v1::light::RemoteHeaderResponse {
 					header: dummy_header().encode(),
-					proof: Vec::new(),
+					proof: empty_proof()
 				};
 				api::v1::light::Response {
 					id: 1,
@@ -1531,21 +1540,21 @@ mod tests {
 				}
 			}
 			Request::Read{..} => {
-				let r = api::v1::light::RemoteReadResponse { proof: Vec::new() };
+				let r = api::v1::light::RemoteReadResponse { proof: empty_proof() };
 				api::v1::light::Response {
 					id: 1,
 					response: Some(api::v1::light::response::Response::RemoteReadResponse(r)),
 				}
 			}
 			Request::ReadChild{..} => {
-				let r = api::v1::light::RemoteReadResponse { proof: Vec::new() };
+				let r = api::v1::light::RemoteReadResponse { proof: empty_proof() };
 				api::v1::light::Response {
 					id: 1,
 					response: Some(api::v1::light::response::Response::RemoteReadResponse(r)),
 				}
 			}
 			Request::Call{..} => {
-				let r = api::v1::light::RemoteCallResponse { proof: Vec::new() };
+				let r = api::v1::light::RemoteCallResponse { proof: empty_proof() };
 				api::v1::light::Response {
 					id: 1,
 					response: Some(api::v1::light::response::Response::RemoteCallResponse(r)),
@@ -1556,7 +1565,7 @@ mod tests {
 					max: iter::repeat(1).take(32).collect(),
 					proof: Vec::new(),
 					roots: Vec::new(),
-					roots_proof: Vec::new(),
+					roots_proof: empty_proof()
 				};
 				api::v1::light::Response {
 					id: 1,
@@ -1680,7 +1689,7 @@ mod tests {
 			future::join(a, b).map(|_| ())
 		};
 
-		block_on(future)
+		task::spawn(future);
 	}
 
 	#[test]
@@ -1694,7 +1703,7 @@ mod tests {
 			retry_count: None,
 		};
 		send_receive(Request::Call { request, sender: chan.0 });
-		assert_eq!(vec![42], block_on(chan.1).unwrap().unwrap());
+		assert_eq!(vec![42], task::block_on(chan.1).unwrap().unwrap());
 		//              ^--- from `DummyFetchChecker::check_execution_proof`
 	}
 
@@ -1708,7 +1717,7 @@ mod tests {
 			retry_count: None
 		};
 		send_receive(Request::Read { request, sender: chan.0 });
-		assert_eq!(Some(vec![42]), block_on(chan.1).unwrap().unwrap().remove(&b":key"[..]).unwrap());
+		assert_eq!(Some(vec![42]), task::block_on(chan.1).unwrap().unwrap().remove(&b":key"[..]).unwrap());
 		//                   ^--- from `DummyFetchChecker::check_read_proof`
 	}
 
@@ -1726,7 +1735,7 @@ mod tests {
 			retry_count: None,
 		};
 		send_receive(Request::ReadChild { request, sender: chan.0 });
-		assert_eq!(Some(vec![42]), block_on(chan.1).unwrap().unwrap().remove(&b":key"[..]).unwrap());
+		assert_eq!(Some(vec![42]), task::block_on(chan.1).unwrap().unwrap().remove(&b":key"[..]).unwrap());
 		//                   ^--- from `DummyFetchChecker::check_read_child_proof`
 	}
 
@@ -1741,7 +1750,7 @@ mod tests {
 		};
 		send_receive(Request::Header { request, sender: chan.0 });
 		// The remote does not know block 1:
-		assert_matches!(block_on(chan.1).unwrap(), Err(ClientError::RemoteFetchFailed));
+		assert_matches!(task::block_on(chan.1).unwrap(), Err(ClientError::RemoteFetchFailed));
 	}
 
 	#[test]
@@ -1762,7 +1771,7 @@ mod tests {
 			retry_count: None,
 		};
 		send_receive(Request::Changes { request, sender: chan.0 });
-		assert_eq!(vec![(100, 2)], block_on(chan.1).unwrap().unwrap());
+		assert_eq!(vec![(100, 2)], task::block_on(chan.1).unwrap().unwrap());
 		//              ^--- from `DummyFetchChecker::check_changes_proof`
 	}
 }

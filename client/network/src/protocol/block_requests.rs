@@ -274,7 +274,7 @@ where
 	}
 
 	fn poll(&mut self, cx: &mut Context, _: &mut impl PollParameters) -> Poll<NetworkBehaviourAction<DeniedUpgrade, Void>> {
-		while self.outgoing.poll_next_unpin(cx).is_ready() {}
+		while let Poll::Ready(Some(_)) = self.outgoing.poll_next_unpin(cx) {}
 		Poll::Pending
 	}
 }
