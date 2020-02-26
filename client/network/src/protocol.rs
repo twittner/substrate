@@ -859,6 +859,7 @@ impl<B: BlockT, H: ExHashT> Protocol<B, H> {
 			behaviour: &mut self.behaviour,
 			peerset: self.peerset_handle.clone(),
 		});
+		log::info!("{:#?}", self.sync.mem_usage())
 	}
 
 	fn maintain_peers(&mut self) {

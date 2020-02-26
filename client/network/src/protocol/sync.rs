@@ -285,6 +285,16 @@ pub enum OnBlockFinalityProof<B: BlockT> {
 	}
 }
 
+#[derive(Debug, Clone)]
+pub struct Memory {
+	peers: usize,
+	queue_blocks: usize,
+	fork_targets: (usize, usize),
+	extra_finality_proofs: extra_requests::Memory,
+	extra_justifications: extra_requests::Memory,
+	blocks: blocks::Memory
+}
+
 impl<B: BlockT> ChainSync<B> {
 	/// Create a new instance.
 	pub fn new(
@@ -318,6 +328,18 @@ impl<B: BlockT> ChainSync<B> {
 			is_idle: false,
 			block_announce_validator,
 			max_parallel_downloads,
+		}
+	}
+
+	pub fn mem_usage(&self) -> Memory {
+		let fork_targets_peers = self.fork_targets.values().map(|t| t.peers.len()).sum();
+		Memory {
+			peers: self.peers.len(),
+			queue_blocks: self.queue_blocks.len(),
+			fork_targets: (self.fork_targets.len(), fork_targets_peers),
+			extra_finality_proofs: self.extra_finality_proofs.mem_usage(),
+			extra_justifications: self.extra_justifications.mem_usage(),
+			blocks: self.blocks.mem_usage()
 		}
 	}
 

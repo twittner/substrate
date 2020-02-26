@@ -59,12 +59,25 @@ pub struct BlockCollection<B: BlockT> {
 	peer_requests: HashMap<PeerId, NumberFor<B>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct Memory {
+	blocks: usize,
+	peer_requests: usize,
+}
+
 impl<B: BlockT> BlockCollection<B> {
 	/// Create a new instance.
 	pub fn new() -> Self {
 		BlockCollection {
 			blocks: BTreeMap::new(),
 			peer_requests: HashMap::new(),
+		}
+	}
+
+	pub(crate) fn mem_usage(&self) -> Memory {
+		Memory {
+			blocks: self.blocks.len(),
+			peer_requests: self.peer_requests.len()
 		}
 	}
 

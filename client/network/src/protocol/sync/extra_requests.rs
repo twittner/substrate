@@ -53,6 +53,14 @@ pub(crate) struct ExtraRequests<B: BlockT> {
 	request_type_name: &'static str,
 }
 
+#[derive(Debug, Clone)]
+pub struct Memory {
+	pending_requests: usize,
+	active_requests: usize,
+	failed_requests: usize,
+	importing_requests: usize
+}
+
 impl<B: BlockT> ExtraRequests<B> {
 	pub(crate) fn new(request_type_name: &'static str) -> Self {
 		ExtraRequests {
@@ -63,6 +71,15 @@ impl<B: BlockT> ExtraRequests<B> {
 			failed_requests: HashMap::new(),
 			importing_requests: HashSet::new(),
 			request_type_name,
+		}
+	}
+
+	pub(crate) fn mem_usage(&self) -> Memory {
+		Memory {
+			pending_requests: self.pending_requests.len(),
+			active_requests: self.active_requests.len(),
+			failed_requests: self.failed_requests.len(),
+			importing_requests: self.importing_requests.len()
 		}
 	}
 
