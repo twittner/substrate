@@ -27,7 +27,7 @@ use libp2p::swarm::{NetworkBehaviourAction, NetworkBehaviourEventProcess, PollPa
 use log::debug;
 use sp_consensus::{BlockOrigin, import_queue::{IncomingBlock, Origin}};
 use sp_runtime::{traits::{Block as BlockT, NumberFor}, ConsensusEngineId, Justification};
-use std::{borrow::Cow, iter, task::Context, task::Poll};
+use std::{borrow::Cow, io, iter, task::Context, task::Poll};
 use void;
 
 /// General behaviour of the network. Combines all protocols together.
@@ -67,7 +67,7 @@ pub enum BehaviourOut<B: BlockT> {
 
 impl<B: BlockT, H: ExHashT> Behaviour<B, H> {
 	/// Builds a new `Behaviour`.
-	pub fn new(
+	pub async fn new(
 		substrate: Protocol<B, H>,
 		role: Role,
 		user_agent: String,
@@ -75,16 +75,16 @@ impl<B: BlockT, H: ExHashT> Behaviour<B, H> {
 		block_requests: protocol::BlockRequests<B>,
 		light_client_handler: protocol::LightClientHandler<B>,
 		disco_config: DiscoveryConfig,
-	) -> Self {
-		Behaviour {
+	) -> io::Result<Self> {
+		Ok(Behaviour {
 			substrate,
 			debug_info: debug_info::DebugInfoBehaviour::new(user_agent, local_public_key.clone()),
-			discovery: disco_config.finish(),
+			discovery: disco_config.finish().await?,
 			block_requests,
 			light_client_handler,
 			events: Vec::new(),
 			role,
-		}
+		})
 	}
 
 	/// Returns the list of nodes that we know exist in the network.

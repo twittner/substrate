@@ -315,7 +315,7 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkWorker<B, H> {
 			};
 
 			let discovery_config = {
-				let mut config = DiscoveryConfig::new(local_public.clone());
+				let mut config = DiscoveryConfig::new(local_identity, todo!());
 				config.with_user_defined(known_addresses);
 				config.discovery_limit(u64::from(params.network_config.out_peers) + 15);
 				config.add_protocol(params.protocol_id.clone());
@@ -331,7 +331,7 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkWorker<B, H> {
 					}
 				}
 
-				config
+				async_std::task::block_on(config.finish())?
 			};
 
 			let mut behaviour = Behaviour::new(

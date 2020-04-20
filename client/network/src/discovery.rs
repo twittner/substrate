@@ -46,9 +46,12 @@
 //!
 
 use crate::config::ProtocolId;
+#[cfg(not(target_os = "unknown"))]
+use crate::pinger::{self, Pinger};
 use futures::prelude::*;
 use futures_timer::Delay;
-use libp2p::core::{connection::{ConnectionId, ListenerId}, ConnectedPoint, Multiaddr, PeerId, PublicKey};
+use libp2p::core::{connection::{ConnectionId, ListenerId}, ConnectedPoint, Multiaddr, PeerId};
+use libp2p::identity::Keypair;
 use libp2p::swarm::{NetworkBehaviour, NetworkBehaviourAction, PollParameters, ProtocolsHandler};
 use libp2p::swarm::protocols_handler::multi::MultiHandler;
 use libp2p::kad::{Kademlia, KademliaConfig, KademliaEvent, Quorum, Record};
@@ -68,6 +71,8 @@ use sp_core::hexdisplay::HexDisplay;
 
 /// `DiscoveryBehaviour` configuration.
 pub struct DiscoveryConfig {
+	keypair: Keypair,
+	udp_addr: Multiaddr,
 	local_peer_id: PeerId,
 	user_defined: Vec<(PeerId, Multiaddr)>,
 	allow_private_ipv4: bool,
@@ -78,9 +83,12 @@ pub struct DiscoveryConfig {
 
 impl DiscoveryConfig {
 	/// Create a default configuration with the given public key.
-	pub fn new(local_public_key: PublicKey) -> Self {
+	pub fn new(keypair: Keypair, udp_addr: Multiaddr) -> Self {
+		let local_peer_id = keypair.public().into_peer_id();
 		let mut this = DiscoveryConfig {
-			local_peer_id: local_public_key.into_peer_id(),
+			keypair,
+			udp_addr,
+			local_peer_id,
 			user_defined: Vec::new(),
 			allow_private_ipv4: true,
 			discovery_only_if_under_num: std::u64::MAX,
@@ -167,8 +175,11 @@ impl DiscoveryConfig {
 	}
 
 	/// Create a `DiscoveryBehaviour` from this config.
-	pub fn finish(self) -> DiscoveryBehaviour {
-		DiscoveryBehaviour {
+	pub async fn finish(self) -> io::Result<DiscoveryBehaviour> {
+		let (pinger, sender) = Pinger::open(self.keypair, &self.udp_addr).await
+			.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+		Ok(DiscoveryBehaviour {
 			user_defined: self.user_defined,
 			kademlias: self.kademlias,
 			next_kad_random_query: Delay::new(Duration::new(0, 0)),
@@ -190,7 +201,11 @@ impl DiscoveryConfig {
 			} else {
 				None.into()
 			},
-		}
+			#[cfg(not(target_os = "unknown"))]
+			pinger,
+			#[cfg(not(target_os = "unknown"))]
+			sender
+		})
 	}
 }
 
@@ -219,6 +234,12 @@ pub struct DiscoveryBehaviour {
 	allow_private_ipv4: bool,
 	/// Number of active connections over which we interrupt the discovery process.
 	discovery_only_if_under_num: u64,
+	/// Address checker.
+	#[cfg(not(target_os = "unknown"))]
+	pinger: Pinger,
+	/// Address check requester.
+	#[cfg(not(target_os = "unknown"))]
+	sender: pinger::Sender
 }
 
 impl DiscoveryBehaviour {

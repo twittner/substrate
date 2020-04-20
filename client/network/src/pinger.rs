@@ -387,15 +387,15 @@ pub(crate) enum Error {
 
 	/// Encoding of an outbound message failed.
 	#[error("encoding failed: {0}")]
-	Encoding(#[from] Box<dyn std::error::Error + Send>),
+	Encoding(#[from] Box<dyn std::error::Error + Send + Sync>),
 
 	/// Decoding of an inbound message failed.
 	#[error("decoding failed: {0}")]
-	Decoding(#[source] Box<dyn std::error::Error + Send>),
+	Decoding(#[source] Box<dyn std::error::Error + Send + Sync>),
 
 	/// Signing an outbound message failed.
 	#[error("message signing failed: {0}")]
-	Signing(#[source] Box<dyn std::error::Error + Send>),
+	Signing(#[source] Box<dyn std::error::Error + Send + Sync>),
 
 	/// A nonce was missing or had the wrong format in an inbound message.
 	#[error("missing or invalid nonce")]
@@ -415,6 +415,6 @@ pub(crate) enum Error {
 
 	/// Attempt to request an address check but the `Pinger` has been dropped already.
 	#[error("failed to request an address check: {0}")]
-	RequestFailed(#[source] Box<dyn std::error::Error + Send>)
+	RequestFailed(#[source] Box<dyn std::error::Error + Send + Sync>)
 }
 

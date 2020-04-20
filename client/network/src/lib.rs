@@ -237,11 +237,13 @@ mod chain;
 mod debug_info;
 mod discovery;
 mod on_demand_layer;
-mod pinger;
 mod protocol;
 mod service;
 mod transport;
 mod utils;
+
+#[cfg(not(target_os = "unknown"))]
+mod pinger;
 
 pub mod config;
 pub mod error;
