@@ -237,7 +237,7 @@ mod chain;
 mod debug_info;
 mod discovery;
 mod on_demand_layer;
-mod pingpong;
+mod pinger;
 mod protocol;
 mod service;
 mod transport;
