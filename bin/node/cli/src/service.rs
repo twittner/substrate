@@ -190,7 +190,7 @@ macro_rules! new_full {
 				select_chain,
 				env: proposer,
 				block_import,
-				sync_oracle: service.network(),
+				sync_oracle: service.network().clone(),
 				inherent_data_providers: inherent_data_providers.clone(),
 				force_authoring,
 				babe_link,
@@ -217,11 +217,16 @@ macro_rules! new_full {
 				_ => unreachable!("Due to outer matches! constraint; qed.")
 			};
 
-			let network = service.network();
-			let dht_event_stream = network.event_stream("authority-discovery").filter_map(|e| async move { match e {
-				Event::Dht(e) => Some(e),
-				_ => None,
-			}}).boxed();
+			let mut network = service.network().clone();
+			let dht_event_stream = futures::executor::block_on(async {
+				network.event_stream("authority-discovery")
+					.await
+					.unwrap()
+					.filter_map(|e| async { match e {
+						Event::Dht(e) => Some(e),
+						_ => None,
+					}})
+			}).boxed();
 			let authority_discovery = sc_authority_discovery::AuthorityDiscovery::new(
 				service.client(),
 				network,
@@ -231,7 +236,7 @@ macro_rules! new_full {
 				service.prometheus_registry(),
 			);
 
-			service.spawn_task("authority-discovery", authority_discovery);
+			service.spawn_task("authority-discovery", authority_discovery.exec());
 		}
 
 		// if the node isn't actively participating in consensus then it doesn't
@@ -263,7 +268,7 @@ macro_rules! new_full {
 			let grandpa_config = grandpa::GrandpaParams {
 				config,
 				link: grandpa_link,
-				network: service.network(),
+				network: service.network().clone(),
 				inherent_data_providers: inherent_data_providers.clone(),
 				telemetry_on_connect: Some(service.telemetry_on_connect_stream()),
 				voting_rule: grandpa::VotingRulesBuilder::default().build(),
@@ -281,7 +286,7 @@ macro_rules! new_full {
 			grandpa::setup_disabled_grandpa(
 				service.client(),
 				&inherent_data_providers,
-				service.network(),
+				service.network().clone(),
 			)?;
 		}
 
@@ -448,7 +453,7 @@ mod tests {
 				)
 			);
 
-			let consensus_net = ConsensusNetwork::new(service.network(), service.client().clone());
+			let consensus_net = ConsensusNetwork::new(service.network().clone(), service.client().clone());
 			let proposer_factory = consensus::ProposerFactory {
 				client: service.client().clone(),
 				transaction_pool: service.transaction_pool().clone(),

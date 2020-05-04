@@ -953,7 +953,7 @@ ServiceBuilder<
 			let txpool = Arc::downgrade(&transaction_pool);
 			let offchain = offchain_workers.as_ref().map(Arc::downgrade);
 			let notifications_spawn_handle = task_manager.spawn_handle();
-			let network_state_info: Arc<dyn NetworkStateInfo + Send + Sync> = network.clone();
+			let network_state_info: Arc<dyn NetworkStateInfo + Send + Sync> = Arc::new(network.clone());
 			let is_validator = config.role.is_authority();
 
 			let (import_stream, finality_stream) = (
@@ -1011,20 +1011,18 @@ ServiceBuilder<
 
 		{
 			// extrinsic notifications
-			let network = Arc::downgrade(&network);
 			let transaction_pool_ = transaction_pool.clone();
-			let events = transaction_pool.import_notification_stream()
-				.for_each(move |hash| {
-					if let Some(network) = network.upgrade() {
-						network.propagate_extrinsic(hash);
-					}
+			let mut network_ = network.clone();
+			let events = async move {
+				while let Some(hash) = transaction_pool_.import_notification_stream().next().await {
+					network_.propagate_extrinsic(hash).await.unwrap(); // TODO
 					let status = transaction_pool_.status();
 					telemetry!(SUBSTRATE_INFO; "txpool.import";
 						"ready" => status.ready,
 						"future" => status.future
 					);
-					ready(())
-				});
+				}
+			};
 
 			spawn_handle.spawn(
 				"on-transaction-imported",

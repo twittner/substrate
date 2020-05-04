@@ -14,83 +14,40 @@
 // You should have received a copy of the GNU General Public License
 // along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
 
-use crate::{Network, Validator};
+use crate::{Error, Network, Validator};
 use crate::state_machine::{ConsensusGossip, TopicNotification, PERIODIC_MAINTENANCE_INTERVAL};
 
 use sc_network::{Event, ReputationChange};
 
-use futures::prelude::*;
-use futures::channel::mpsc::{channel, Sender, Receiver};
+use futures::{prelude::*, channel::mpsc::{self, channel, Sender, Receiver}, stream::BoxStream};
+use futures_timer::Delay;
 use libp2p::PeerId;
 use log::trace;
 use sp_runtime::{traits::Block as BlockT, ConsensusEngineId};
 use std::{
 	borrow::Cow,
-	collections::{HashMap, VecDeque},
-	pin::Pin,
-	sync::Arc,
-	task::{Context, Poll},
+	collections::{HashMap, hash_map::Entry},
+	sync::Arc
 };
 
-/// Wraps around an implementation of the `Network` crate and provides gossiping capabilities on
-/// top of it.
-pub struct GossipEngine<B: BlockT> {
-	state_machine: ConsensusGossip<B>,
-	network: Box<dyn Network<B> + Send>,
-	periodic_maintenance_interval: futures_timer::Delay,
-	engine_id: ConsensusEngineId,
-
-	/// Incoming events from the network.
-	network_event_stream: Pin<Box<dyn Stream<Item = Event> + Send>>,
-	/// Outgoing events to the consumer.
-	message_sinks: HashMap<B::Hash, Vec<Sender<TopicNotification>>>,
-	/// Buffered messages (see [`ForwardingState`]).
-	forwarding_state: ForwardingState<B>,
+#[derive(Debug)]
+enum Command<B: BlockT> {
+	Report(PeerId, ReputationChange),
+	Register(B::Hash, Vec<u8>),
+	Broadcast(B::Hash, bool),
+	MessagesFor(B::Hash, Sender<TopicNotification>),
+	SendTopic(PeerId, B::Hash, bool),
+	GossipMessage(B::Hash, Vec<u8>, bool),
+	SendMessage(Vec<PeerId>, Vec<u8>),
+	Announce(B::Hash, Vec<u8>)
 }
 
-/// A gossip engine receives messages from the network via the `network_event_stream` and forwards
-/// them to upper layers via the `message sinks`. In the scenario where messages have been received
-/// from the network but a subscribed message sink is not yet ready to receive the messages, the
-/// messages are buffered. To model this process a gossip engine can be in two states.
-enum ForwardingState<B: BlockT> {
-	/// The gossip engine is currently not forwarding any messages and will poll the network for
-	/// more messages to forward.
-	Idle,
-	/// The gossip engine is in the progress of forwarding messages and thus will not poll the
-	/// network for more messages until it has send all current messages into the subscribed message
-	/// sinks.
-	Busy(VecDeque<(B::Hash, TopicNotification)>),
-}
+#[derive(Debug, Clone)]
+pub struct GossipEngineControl<B: BlockT>(mpsc::Sender<Command<B>>);
 
-impl<B: BlockT> Unpin for GossipEngine<B> {}
-
-impl<B: BlockT> GossipEngine<B> {
-	/// Create a new instance.
-	pub fn new<N: Network<B> + Send + Clone + 'static>(
-		network: N,
-		engine_id: ConsensusEngineId,
-		protocol_name: impl Into<Cow<'static, [u8]>>,
-		validator: Arc<dyn Validator<B>>,
-	) -> Self where B: 'static {
-		// We grab the event stream before registering the notifications protocol, otherwise we
-		// might miss events.
-		let network_event_stream = network.event_stream();
-		network.register_notifications_protocol(engine_id, protocol_name.into());
-
-		GossipEngine {
-			state_machine: ConsensusGossip::new(validator, engine_id),
-			network: Box::new(network),
-			periodic_maintenance_interval: futures_timer::Delay::new(PERIODIC_MAINTENANCE_INTERVAL),
-			engine_id,
-
-			network_event_stream,
-			message_sinks: HashMap::new(),
-			forwarding_state: ForwardingState::Idle,
-		}
-	}
-
-	pub fn report(&self, who: PeerId, reputation: ReputationChange) {
-		self.network.report_peer(who, reputation);
+impl<B: BlockT> GossipEngineControl<B> {
+	pub async fn report(&mut self, who: PeerId, reputation: ReputationChange) -> Result<(), Error> {
+		self.0.send(Command::Report(who, reputation)).await.map_err(|_| Error::EngineGone)
 	}
 
 	/// Registers a message without propagating it to any peers. The message
@@ -98,208 +55,227 @@ impl<B: BlockT> GossipEngine<B> {
 	/// the message's topic. No validation is performed on the message, if the
 	/// message is already expired it should be dropped on the next garbage
 	/// collection.
-	pub fn register_gossip_message(
+	pub async fn register_gossip_message(
 		&mut self,
 		topic: B::Hash,
 		message: Vec<u8>,
-	) {
-		self.state_machine.register_message(topic, message);
+	) -> Result<(), Error> {
+		self.0.send(Command::Register(topic, message)).await.map_err(|_| Error::EngineGone)
 	}
 
 	/// Broadcast all messages with given topic.
-	pub fn broadcast_topic(&mut self, topic: B::Hash, force: bool) {
-		self.state_machine.broadcast_topic(&mut *self.network, topic, force);
+	pub async fn broadcast_topic(&mut self, topic: B::Hash, force: bool) -> Result<(), Error> {
+		self.0.send(Command::Broadcast(topic, force)).await.map_err(|_| Error::EngineGone)
 	}
 
 	/// Get data of valid, incoming messages for a topic (but might have expired meanwhile).
-	pub fn messages_for(&mut self, topic: B::Hash)
-		-> Receiver<TopicNotification>
-	{
-		let past_messages = self.state_machine.messages_for(topic).collect::<Vec<_>>();
-		// The channel length is not critical for correctness. By the implementation of `channel`
-		// each sender is guaranteed a single buffer slot, making it a non-rendezvous channel and
-		// thus preventing direct dead-locks. A minimum channel length of 10 is an estimate based on
-		// the fact that despite `NotificationsReceived` having a `Vec` of messages, it only ever
-		// contains a single message.
-		let (mut tx, rx) = channel(usize::max(past_messages.len(), 10));
-
-		for notification in past_messages{
-			tx.try_send(notification)
-				.expect("receiver known to be live, and buffer size known to suffice; qed");
-		}
-
-		self.message_sinks.entry(topic).or_default().push(tx);
-
-		rx
+	pub async fn messages_for(&mut self, topic: B::Hash) -> Result<Receiver<TopicNotification>, Error> {
+		let (tx, rx) = channel(16);
+		self.0.send(Command::MessagesFor(topic, tx)).await.map_err(|_| Error::EngineGone)?;
+		Ok(rx)
 	}
 
 	/// Send all messages with given topic to a peer.
-	pub fn send_topic(
+	pub async fn send_topic(
 		&mut self,
-		who: &PeerId,
+		who: PeerId,
 		topic: B::Hash,
 		force: bool
-	) {
-		self.state_machine.send_topic(&mut *self.network, who, topic, force)
+	) -> Result<(), Error> {
+		self.0.send(Command::SendTopic(who, topic, force)).await.map_err(|_| Error::EngineGone)
 	}
 
 	/// Multicast a message to all peers.
-	pub fn gossip_message(
+	pub async fn gossip_message(
 		&mut self,
 		topic: B::Hash,
 		message: Vec<u8>,
 		force: bool,
-	) {
-		self.state_machine.multicast(&mut *self.network, topic, message, force)
+	) -> Result<(), Error> {
+		self.0.send(Command::GossipMessage(topic, message, force)).await
+			.map_err(|_| Error::EngineGone)
 	}
 
 	/// Send addressed message to the given peers. The message is not kept or multicast
 	/// later on.
-	pub fn send_message(&mut self, who: Vec<sc_network::PeerId>, data: Vec<u8>) {
-		for who in &who {
-			self.state_machine.send_message(&mut *self.network, who, data.clone());
-		}
+	pub async fn send_message(
+		&mut self,
+		who: Vec<sc_network::PeerId>,
+		data: Vec<u8>
+	) -> Result<(), Error> {
+		self.0.send(Command::SendMessage(who, data)).await.map_err(|_| Error::EngineGone)
 	}
 
 	/// Notify everyone we're connected to that we have the given block.
 	///
 	/// Note: this method isn't strictly related to gossiping and should eventually be moved
 	/// somewhere else.
-	pub fn announce(&self, block: B::Hash, associated_data: Vec<u8>) {
-		self.network.announce(block, associated_data);
+	pub async fn announce(&mut self, block: B::Hash, associated_data: Vec<u8>) -> Result<(), Error> {
+		self.0.send(Command::Announce(block, associated_data)).await.map_err(|_| Error::EngineGone)
 	}
 }
 
-impl<B: BlockT> Future for GossipEngine<B> {
-	type Output = ();
+/// Wraps around an implementation of the `Network` type and provides gossiping capabilities on
+/// top of it.
+pub struct GossipEngine<B: BlockT> {
+	engine_id: ConsensusEngineId,
+	state_machine: ConsensusGossip<B>,
+	network: Box<dyn Network<B> + Send>,
+	periodic_maintenance_interval: stream::Fuse<BoxStream<'static, ()>>,
+	network_event_stream: stream::Fuse<BoxStream<'static, Event>>,
+	command_stream: mpsc::Receiver<Command<B>>,
+	/// Outgoing events to the consumer.
+	message_sinks: HashMap<B::Hash, Vec<Sender<TopicNotification>>>,
+}
 
-	fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-		let this = &mut *self;
+impl<B: BlockT> Unpin for GossipEngine<B> {}
 
+impl<B: BlockT> GossipEngine<B> {
+	/// Create a new instance.
+	pub async fn new<N: Network<B> + Send + Clone + 'static>(
+		mut network: N,
+		engine_id: ConsensusEngineId,
+		protocol_name: impl Into<Cow<'static, [u8]>>,
+		validator: Arc<dyn Validator<B>>,
+	) -> Result<(Self, GossipEngineControl<B>), Error> where B: 'static {
+		// We grab the event stream before registering the notifications protocol,
+		// otherwise we might miss events.
+		let network_event_stream = network.event_stream().await?.fuse();
+		network.register_notifications_protocol(engine_id, protocol_name.into()).await?;
+
+		let periodic_maintenance_interval =
+			stream::unfold(Delay::new(PERIODIC_MAINTENANCE_INTERVAL), |mut delay| async {
+				(&mut delay).await;
+				delay.reset(PERIODIC_MAINTENANCE_INTERVAL);
+				Some(((), delay))
+			})
+			.boxed()
+			.fuse();
+
+		let (tx, rx) = mpsc::channel(1);
+		let control = GossipEngineControl(tx);
+		let engine = GossipEngine {
+			engine_id,
+			state_machine: ConsensusGossip::new(validator, engine_id),
+			network: Box::new(network),
+			periodic_maintenance_interval,
+			network_event_stream,
+			command_stream: rx,
+			message_sinks: HashMap::new(),
+		};
+
+		Ok((engine, control))
+	}
+
+	pub async fn exec(mut self) -> Result<(), Error> {
 		'outer: loop {
-			match &mut this.forwarding_state {
-				ForwardingState::Idle => {
-					match this.network_event_stream.poll_next_unpin(cx) {
-						Poll::Ready(Some(event)) => match event {
-							Event::NotificationStreamOpened { remote, engine_id, role } => {
-								if engine_id != this.engine_id {
-									continue;
+			futures::select! {
+				command = self.command_stream.next() => if let Some(command) = command {
+					match command {
+						Command::Report(who, reputation) =>
+							self.network.report_peer(who, reputation),
+						Command::Register(topic, message) =>
+							self.state_machine.register_message(topic, message),
+						Command::Broadcast(topic, force) =>
+							self.state_machine.broadcast_topic(&mut *self.network, topic, force).await?,
+						Command::MessagesFor(topic, mut tx) => {
+							for notification in self.state_machine.messages_for(topic) {
+								if tx.send(notification).await.is_err() {
+									continue 'outer
 								}
-								this.state_machine.new_peer(&mut *this.network, remote, role);
 							}
-							Event::NotificationStreamClosed { remote, engine_id } => {
-								if engine_id != this.engine_id {
-									continue;
-								}
-								this.state_machine.peer_disconnected(&mut *this.network, remote);
-							},
-							Event::NotificationsReceived { remote, messages } => {
-								let messages = messages.into_iter().filter_map(|(engine, data)| {
-									if engine == this.engine_id {
-										Some(data.to_vec())
-									} else {
-										None
-									}
-								}).collect();
-
-								let to_forward = this.state_machine.on_incoming(
-									&mut *this.network,
-									remote,
-									messages,
-								);
-
-								this.forwarding_state = ForwardingState::Busy(to_forward.into());
-							},
-							Event::Dht(_) => {}
+							self.message_sinks.entry(topic).or_default().push(tx)
 						}
-						// The network event stream closed. Do the same for [`GossipValidator`].
-						Poll::Ready(None) => return Poll::Ready(()),
-						Poll::Pending => break,
+						Command::SendTopic(who, topic, force) =>
+							self.state_machine.send_topic(&mut *self.network, &who, topic, force).await?,
+						Command::GossipMessage(topic, message, force) =>
+							self.state_machine.multicast(&mut *self.network, topic, message, force).await?,
+						Command::Announce(block, associated_data) =>
+							self.network.announce(block, associated_data).await?,
+						Command::SendMessage(who, data) => for who in &who {
+							self.state_machine.send_message(&mut *self.network, who, data.clone()).await?
+						}
 					}
-				}
-				ForwardingState::Busy(to_forward) => {
-					let (topic, notification) = match to_forward.pop_front() {
-						Some(n) => n,
-						None => {
-							this.forwarding_state = ForwardingState::Idle;
-							continue;
+				} else {
+					return Ok(())
+				},
+				event = self.network_event_stream.next() => if let Some(event) = event {
+					match event {
+						Event::NotificationStreamOpened { remote, engine_id: msg_engine_id, role } => {
+							if msg_engine_id != self.engine_id {
+								continue;
+							}
+							self.state_machine.new_peer(&mut *self.network, remote, role);
 						}
-					};
-
-					let sinks = match this.message_sinks.get_mut(&topic) {
-						Some(sinks) => sinks,
-						None => {
-							continue;
+						Event::NotificationStreamClosed { remote, engine_id: msg_engine_id } => {
+							if msg_engine_id != self.engine_id {
+								continue;
+							}
+							self.state_machine.peer_disconnected(&mut *self.network, remote);
 						},
-					};
+						Event::NotificationsReceived { remote, messages } => {
+							let messages = messages.into_iter().filter_map(|(engine, data)| {
+								if engine == self.engine_id {
+									Some(data.to_vec())
+								} else {
+									None
+								}
+							}).collect();
 
-					// Make sure all sinks for the given topic are ready.
-					for sink in sinks.iter_mut() {
-						match sink.poll_ready(cx) {
-							Poll::Ready(Ok(())) => {},
-							// Receiver has been dropped. Ignore for now, filtered out in (1).
-							Poll::Ready(Err(_)) => {},
-							Poll::Pending => {
-								// Push back onto queue for later.
-								to_forward.push_front((topic, notification));
-								break 'outer;
+							let to_forward = self.state_machine.on_incoming(
+								&mut *self.network,
+								remote,
+								messages,
+							);
+
+							for (topic, notification) in to_forward {
+								if let Entry::Occupied(mut entry) = self.message_sinks.entry(topic) {
+									trace!(
+										target: "gossip",
+										"Pushing consensus message to sinks for {}.", topic,
+									);
+									let sinks = entry.get_mut();
+									sinks.retain(|sink| !sink.is_closed());
+									for sink in sinks {
+										if let Err(e) = sink.send(notification.clone()).await {
+											trace!(
+												target: "gossip",
+												"Error broadcasting message notification: {:?}", e,
+											);
+										}
+									}
+									if entry.get().is_empty() {
+										entry.remove_entry();
+									}
+								}
 							}
-						}
+						},
+						Event::Dht(_) => {}
 					}
+				} else {
+					return Ok(())
+				},
 
-					// Filter out all closed sinks.
-					sinks.retain(|sink| !sink.is_closed()); // (1)
-
-					if sinks.is_empty() {
-						this.message_sinks.remove(&topic);
-						continue;
-					}
-
-					trace!(
-						target: "gossip",
-						"Pushing consensus message to sinks for {}.", topic,
-					);
-
-					// Send the notification on each sink.
-					for sink in sinks {
-						match sink.start_send(notification.clone()) {
-							Ok(()) => {},
-							Err(e) if e.is_full() => unreachable!(
-								"Previously ensured that all sinks are ready; qed.",
-							),
-							// Receiver got dropped. Will be removed in next iteration (See (1)).
-							Err(_) => {},
-						}
-					}
+				_ = self.periodic_maintenance_interval.next() => {
+					self.state_machine.tick(&mut *self.network).await?;
+					self.message_sinks.retain(|_, sinks| {
+						sinks.retain(|sink| !sink.is_closed());
+						!sinks.is_empty()
+					});
 				}
 			}
 		}
-
-
-		while let Poll::Ready(()) = this.periodic_maintenance_interval.poll_unpin(cx) {
-			this.periodic_maintenance_interval.reset(PERIODIC_MAINTENANCE_INTERVAL);
-			this.state_machine.tick(&mut *this.network);
-
-			this.message_sinks.retain(|_, sinks| {
-				sinks.retain(|sink| !sink.is_closed());
-				!sinks.is_empty()
-			});
-		}
-
-		Poll::Pending
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use async_std::task::spawn;
+	use async_trait::async_trait;
 	use crate::{ValidationResult, ValidatorContext};
-	use futures::{channel::mpsc::{unbounded, UnboundedSender}, executor::{block_on, block_on_stream}, future::poll_fn};
-	use quickcheck::{Arbitrary, Gen, QuickCheck};
-	use rand::Rng;
+	use futures::{channel::mpsc::{unbounded, UnboundedSender}, executor::block_on_stream};
 	use sc_network::ObservedRole;
 	use sp_runtime::{testing::H256, traits::{Block as BlockT}};
-	use std::convert::TryInto;
 	use std::sync::{Arc, Mutex};
 	use substrate_test_runtime_client::runtime::Block;
 	use super::*;
@@ -314,33 +290,36 @@ mod tests {
 		event_senders: Vec<UnboundedSender<Event>>,
 	}
 
+	#[async_trait]
 	impl<B: BlockT> Network<B> for TestNetwork {
-		fn event_stream(&self) -> Pin<Box<dyn Stream<Item = Event> + Send>> {
+		async fn event_stream(&mut self) -> Result<BoxStream<'static, Event>, Error> {
 			let (tx, rx) = unbounded();
 			self.inner.lock().unwrap().event_senders.push(tx);
-
-			Box::pin(rx)
+			Ok(rx.boxed())
 		}
 
-		fn report_peer(&self, _: PeerId, _: ReputationChange) {
+		fn report_peer(&mut self, _: PeerId, _: ReputationChange) {
 		}
 
-		fn disconnect_peer(&self, _: PeerId) {
+		async fn disconnect_peer(&mut self, _: PeerId) -> Result<(), Error> {
 			unimplemented!();
 		}
 
-		fn write_notification(&self, _: PeerId, _: ConsensusEngineId, _: Vec<u8>) {
+		async fn write_notification(&mut self, _: PeerId, _: ConsensusEngineId, _: Vec<u8>) -> Result<(), Error> {
 			unimplemented!();
 		}
 
-		fn register_notifications_protocol(&self, _: ConsensusEngineId, _: Cow<'static, [u8]>) {}
+		async fn register_notifications_protocol(&mut self, _: ConsensusEngineId, _: Cow<'static, [u8]>) -> Result<(), Error> {
+			Ok(())
+		}
 
-		fn announce(&self, _: B::Hash, _: Vec<u8>) {
+		async fn announce(&mut self, _: B::Hash, _: Vec<u8>) -> Result<(), Error> {
 			unimplemented!();
 		}
 	}
 
 	struct AllowAll;
+
 	impl Validator<Block> for AllowAll {
 		fn validate(
 			&self,
@@ -359,194 +338,37 @@ mod tests {
 	#[test]
 	fn returns_when_network_event_stream_closes() {
 		let network = TestNetwork::default();
-		let mut gossip_engine = GossipEngine::<Block>::new(
-			network.clone(),
-			[1, 2, 3, 4],
-			"my_protocol".as_bytes(),
-			Arc::new(AllowAll{}),
-		);
+		let (gossip_engine, _gossip_ctrl) =
+			futures::executor::block_on(GossipEngine::<Block>::new(
+				network.clone(),
+				[1, 2, 3, 4],
+				"my_protocol".as_bytes(),
+				Arc::new(AllowAll{}),
+			)).unwrap();
 
 		// Drop network event stream sender side.
 		drop(network.inner.lock().unwrap().event_senders.pop());
 
-		block_on(poll_fn(move |ctx| {
-			if let Poll::Pending = gossip_engine.poll_unpin(ctx) {
-				panic!(
-					"Expected gossip engine to finish on first poll, given that \
-					 `GossipEngine.network_event_stream` closes right away."
-				)
-			}
-			Poll::Ready(())
-		}))
+		futures::executor::block_on(gossip_engine.exec()).unwrap();
 	}
 
 	#[test]
 	fn keeps_multiple_subscribers_per_topic_updated_with_both_old_and_new_messages() {
-		let topic = H256::default();
-		let engine_id = [1, 2, 3, 4];
-		let remote_peer = PeerId::random();
-		let network = TestNetwork::default();
-
-		let mut gossip_engine = GossipEngine::<Block>::new(
-			network.clone(),
-			engine_id.clone(),
-			"my_protocol".as_bytes(),
-			Arc::new(AllowAll{}),
-		);
-
-		let mut event_sender = network.inner.lock()
-			.unwrap()
-			.event_senders
-			.pop()
-			.unwrap();
-
-		// Register the remote peer.
-		event_sender.start_send(
-			Event::NotificationStreamOpened {
-				remote: remote_peer.clone(),
-				engine_id: engine_id.clone(),
-				role: ObservedRole::Authority,
-			}
-		).expect("Event stream is unbounded; qed.");
-
-		let messages = vec![vec![1], vec![2]];
-		let events = messages.iter().cloned().map(|m| {
-			Event::NotificationsReceived {
-				remote: remote_peer.clone(),
-				messages: vec![(engine_id, m.into())]
-			}
-		}).collect::<Vec<_>>();
-
-		// Send first event before subscribing.
-		event_sender.start_send(events[0].clone()).expect("Event stream is unbounded; qed.");
-
-		let mut subscribers = vec![];
-		for _ in 0..2 {
-			subscribers.push(gossip_engine.messages_for(topic));
-		}
-
-		// Send second event after subscribing.
-		event_sender.start_send(events[1].clone()).expect("Event stream is unbounded; qed.");
-
-		spawn(gossip_engine);
-
-		let mut subscribers = subscribers.into_iter()
-			.map(|s| block_on_stream(s))
-			.collect::<Vec<_>>();
-
-		// Expect each subscriber to receive both events.
-		for message in messages {
-			for subscriber in subscribers.iter_mut() {
-				assert_eq!(
-					subscriber.next(),
-					Some(TopicNotification {
-						message: message.clone(),
-						sender: Some(remote_peer.clone()),
-					}),
-				);
-			}
-		}
-	}
-
-	#[test]
-	fn forwarding_to_different_size_and_topic_channels() {
-		#[derive(Clone, Debug)]
-		struct ChannelLengthAndTopic{
-			length: usize,
-			topic: H256,
-		}
-
-		impl Arbitrary for ChannelLengthAndTopic {
-			fn arbitrary<G: Gen>(g: &mut G) -> Self {
-				Self {
-					length: g.gen_range(0, 100),
-					// Make sure channel topics and message topics overlap by choosing a small
-					// range.
-					topic: H256::from_low_u64_ne(g.gen_range(0, 10)),
-				}
-			}
-		}
-
-		#[derive(Clone, Debug)]
-		struct Message {
-			topic: H256,
-		}
-
-		impl Arbitrary for Message{
-			fn arbitrary<G: Gen>(g: &mut G) -> Self {
-				Self {
-					// Make sure channel topics and message topics overlap by choosing a small
-					// range.
-					topic: H256::from_low_u64_ne(g.gen_range(0, 10)),
-				}
-			}
-		}
-
-		/// Validator that always returns `ProcessAndKeep` interpreting the first 32 bytes of data
-		/// as the message topic.
-		struct TestValidator;
-
-		impl Validator<Block> for TestValidator {
-			fn validate(
-				&self,
-				_context: &mut dyn ValidatorContext<Block>,
-				_sender: &PeerId,
-				data: &[u8],
-			) -> ValidationResult<H256> {
-				ValidationResult::ProcessAndKeep(H256::from_slice(&data[0..32]))
-			}
-		}
-
-		fn prop(channels: Vec<ChannelLengthAndTopic>, notifications: Vec<Vec<Message>>) {
+		async_std::task::block_on(async {
+			let topic = H256::default();
 			let engine_id = [1, 2, 3, 4];
 			let remote_peer = PeerId::random();
 			let network = TestNetwork::default();
 
-			let num_channels_per_topic = channels.iter()
-				.fold(HashMap::new(), |mut acc, ChannelLengthAndTopic { topic, .. }| {
-					acc.entry(topic).and_modify(|e| *e += 1).or_insert(1);
-					acc
-				});
+			let (gossip_engine, mut gossip_ctrl) =
+				GossipEngine::<Block>::new(
+					network.clone(),
+					engine_id.clone(),
+					"my_protocol".as_bytes(),
+					Arc::new(AllowAll{}),
+				).await.unwrap();
 
-			let expected_msgs_per_topic_all_chan = notifications.iter()
-				.fold(HashMap::new(), |mut acc, messages| {
-					for message in messages {
-						acc.entry(message.topic).and_modify(|e| *e += 1).or_insert(1);
-					}
-					acc
-				})
-				.into_iter()
-				// Messages are cloned for each channel with the corresponding topic, thus multiply
-				// with the amount of channels per topic. If there is no channel for a given topic,
-				// don't expect any messages for the topic to be received.
-				.map(|(topic, num)| (topic, num_channels_per_topic.get(&topic).unwrap_or(&0) * num))
-				.collect::<HashMap<H256, _>>();
-
-			let mut gossip_engine = GossipEngine::<Block>::new(
-				network.clone(),
-				engine_id.clone(),
-				"my_protocol".as_bytes(),
-				Arc::new(TestValidator{}),
-			);
-
-			// Create channels.
-			let (txs, mut rxs) = channels.iter()
-				.map(|ChannelLengthAndTopic { length, topic }| {
-					(topic.clone(), channel(*length))
-				})
-				.fold((vec![], vec![]), |mut acc, (topic, (tx, rx))| {
-					acc.0.push((topic, tx)); acc.1.push((topic, rx));
-					acc
-				});
-
-			// Insert sender sides into `gossip_engine`.
-			for (topic, tx) in txs {
-				match gossip_engine.message_sinks.get_mut(&topic) {
-					Some(entry) =>  entry.push(tx),
-					None => {gossip_engine.message_sinks.insert(topic, vec![tx]);},
-				}
-			}
-
+			spawn(gossip_engine.exec());
 
 			let mut event_sender = network.inner.lock()
 				.unwrap()
@@ -561,88 +383,42 @@ mod tests {
 					engine_id: engine_id.clone(),
 					role: ObservedRole::Authority,
 				}
-			).expect("Event stream is unbounded; qed.");
+			).unwrap();
 
-			// Send messages into the network event stream.
-			for (i_notification, messages) in notifications.iter().enumerate() {
-				let messages = messages.into_iter().enumerate()
-					.map(|(i_message, Message { topic })| {
-						// Embed the topic in the first 256 bytes of the message to be extracted by
-						// the [`TestValidator`] later on.
-						let mut message = topic.as_bytes().to_vec();
-
-						// Make sure the message is unique via `i_notification` and `i_message` to
-						// ensure [`ConsensusBridge`] does not deduplicate it.
-						message.push(i_notification.try_into().unwrap());
-						message.push(i_message.try_into().unwrap());
-
-						(engine_id, message.into())
-					}).collect();
-
-				event_sender.start_send(Event::NotificationsReceived {
+			let messages = vec![vec![1], vec![2]];
+			let events = messages.iter().cloned().map(|m| {
+				Event::NotificationsReceived {
 					remote: remote_peer.clone(),
-					messages,
-				}).expect("Event stream is unbounded; qed.");
-			}
-
-			let mut received_msgs_per_topic_all_chan = HashMap::<H256, _>::new();
-
-			// Poll both gossip engine and each receiver and track the amount of received messages.
-			block_on(poll_fn(|cx| {
-				loop {
-					if let Poll::Ready(()) = gossip_engine.poll_unpin(cx) {
-						unreachable!(
-							"Event stream sender side is not dropped, thus gossip engine does not \
-							 terminate",
-						);
-					}
-
-					let mut progress = false;
-
-					for (topic, rx) in rxs.iter_mut() {
-						match rx.poll_next_unpin(cx) {
-							Poll::Ready(Some(_)) => {
-								progress = true;
-								received_msgs_per_topic_all_chan.entry(*topic)
-									.and_modify(|e| *e += 1)
-									.or_insert(1);
-							},
-							Poll::Ready(None) => unreachable!(
-								"Sender side of channel is never dropped",
-							),
-							Poll::Pending => {},
-						}
-					}
-
-					if !progress {
-						break;
-					}
+					messages: vec![(engine_id, m.into())]
 				}
-				Poll::Ready(())
-			}));
+			}).collect::<Vec<_>>();
 
-			// Compare amount of expected messages with amount of received messages.
-			for (expected_topic, expected_num) in expected_msgs_per_topic_all_chan.iter() {
-				assert_eq!(
-					received_msgs_per_topic_all_chan.get(&expected_topic).unwrap_or(&0),
-					expected_num,
-				);
+			// Send first event before subscribing.
+			event_sender.start_send(events[0].clone()).unwrap();
+			let mut subscribers = vec![];
+			for _ in 0..2 {
+				subscribers.push(gossip_ctrl.messages_for(topic).await.unwrap());
 			}
-			for (received_topic, received_num) in expected_msgs_per_topic_all_chan.iter() {
-				assert_eq!(
-					expected_msgs_per_topic_all_chan.get(&received_topic).unwrap_or(&0),
-					received_num,
-				);
+
+			// Send second event after subscribing.
+			event_sender.start_send(events[1].clone()).unwrap();
+
+			let mut subscribers = subscribers.into_iter()
+				.map(|s| block_on_stream(s))
+				.collect::<Vec<_>>();
+
+			// Expect each subscriber to receive both events.
+			for message in messages {
+				for subscriber in subscribers.iter_mut() {
+					assert_eq!(
+						subscriber.next(),
+						Some(TopicNotification {
+							message: message.clone(),
+							sender: Some(remote_peer.clone()),
+						}),
+					);
+				}
 			}
-		}
-
-		// Past regressions.
-		prop(vec![], vec![vec![Message{ topic: H256::default()}]]);
-		prop(
-			vec![ChannelLengthAndTopic {length: 71, topic: H256::default()}],
-			vec![vec![Message{ topic: H256::default()}]],
-		);
-
-		QuickCheck::new().quickcheck(prop as fn(_, _))
+		})
 	}
 }

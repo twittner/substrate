@@ -260,6 +260,7 @@ pub mod config;
 pub mod error;
 pub mod network_state;
 
+pub use error::ServiceError;
 pub use service::{NetworkService, NetworkWorker};
 pub use protocol::PeerInfo;
 pub use protocol::event::{Event, DhtEvent, ObservedRole};

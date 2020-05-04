@@ -82,6 +82,7 @@
 //!
 //! We only send polite messages to peers,
 
+use async_std::task::block_on;
 use sp_runtime::traits::{NumberFor, Block as BlockT, Zero};
 use sc_network_gossip::{MessageIntent, ValidatorContext};
 use sc_network::{ObservedRole, PeerId, ReputationChange};
@@ -1454,7 +1455,9 @@ impl<Block: BlockT> sc_network_gossip::Validator<Block> for GossipValidator<Bloc
 
 		if let Some(packet) = packet {
 			let packet_data = GossipMessage::<Block>::from(packet).encode();
-			context.send_message(who, packet_data);
+			block_on(async {
+				context.send_message(who, packet_data).await.unwrap()
+			})
 		}
 	}
 
@@ -1469,17 +1472,23 @@ impl<Block: BlockT> sc_network_gossip::Validator<Block> for GossipValidator<Bloc
 
 		// not with lock held!
 		if let Some(msg) = peer_reply {
-			context.send_message(who, msg.encode());
+			block_on(async {
+				context.send_message(who, msg.encode()).await.unwrap()
+			})
 		}
 
-		for topic in broadcast_topics {
-			context.send_topic(who, topic, false);
-		}
+		block_on(async {
+			for topic in broadcast_topics {
+				context.send_topic(who, topic, false).await.unwrap()
+			}
+		});
 
 		match action {
 			Action::Keep(topic, cb) => {
 				self.report(who.clone(), cb);
-				context.broadcast_message(topic, data.to_vec(), false);
+				block_on(async {
+					context.broadcast_message(topic, data.to_vec(), false).await.unwrap()
+				});
 				sc_network_gossip::ValidationResult::ProcessAndKeep(topic)
 			}
 			Action::ProcessAndDiscard(topic, cb) => {
@@ -1493,116 +1502,108 @@ impl<Block: BlockT> sc_network_gossip::Validator<Block> for GossipValidator<Bloc
 		}
 	}
 
-	fn message_allowed<'a>(&'a self)
-		-> Box<dyn FnMut(&PeerId, MessageIntent, &Block::Hash, &[u8]) -> bool + 'a>
-	{
-		let (inner, do_rebroadcast) = {
-			use parking_lot::RwLockWriteGuard;
+	fn is_message_allowed(&self, who: &PeerId, intent: MessageIntent, topic: &Block::Hash, mut data: &[u8]) -> bool {
+		use parking_lot::RwLockWriteGuard;
 
-			let mut inner = self.inner.write();
-			let now = Instant::now();
-			let do_rebroadcast = if now >= inner.next_rebroadcast {
-				inner.next_rebroadcast = now + REBROADCAST_AFTER;
-				true
-			} else {
-				false
-			};
-
-			// downgrade to read-lock.
-			(RwLockWriteGuard::downgrade(inner), do_rebroadcast)
+		let mut inner = self.inner.write();
+		let now = Instant::now();
+		let do_rebroadcast = if now >= inner.next_rebroadcast {
+			inner.next_rebroadcast = now + REBROADCAST_AFTER;
+			true
+		} else {
+			false
 		};
 
-		Box::new(move |who, intent, topic, mut data| {
-			if let MessageIntent::PeriodicRebroadcast = intent {
-				return do_rebroadcast;
-			}
+		// downgrade to read-lock.
+		let inner = RwLockWriteGuard::downgrade(inner);
 
-			let peer = match inner.peers.peer(who) {
-				None => return false,
-				Some(x) => x,
-			};
+		if let MessageIntent::PeriodicRebroadcast = intent {
+			return do_rebroadcast;
+		}
 
-			// if the topic is not something we're keeping at the moment,
-			// do not send.
-			let (maybe_round, set_id) = match inner.live_topics.topic_info(&topic) {
-				None => return false,
-				Some(x) => x,
-			};
+		let peer = match inner.peers.peer(who) {
+			None => return false,
+			Some(x) => x,
+		};
 
-			if let MessageIntent::Broadcast = intent {
-				if maybe_round.is_some() {
-					if !inner.round_message_allowed(who, peer) {
-						// early return if the vote message isn't allowed at this stage.
-						return false;
-					}
-				} else {
-					if !inner.global_message_allowed(who, peer) {
-						// early return if the global message isn't allowed at this stage.
-						return false;
-					}
+		// if the topic is not something we're keeping at the moment,
+		// do not send.
+		let (maybe_round, set_id) = match inner.live_topics.topic_info(&topic) {
+			None => return false,
+			Some(x) => x,
+		};
+
+		if let MessageIntent::Broadcast = intent {
+			if maybe_round.is_some() {
+				if !inner.round_message_allowed(who, peer) {
+					// early return if the vote message isn't allowed at this stage.
+					return false;
+				}
+			} else {
+				if !inner.global_message_allowed(who, peer) {
+					// early return if the global message isn't allowed at this stage.
+					return false;
 				}
 			}
+		}
 
-			// if the topic is not something the peer accepts, discard.
-			if let Some(round) = maybe_round {
-				return peer.view.consider_vote(round, set_id) == Consider::Accept
+		// if the topic is not something the peer accepts, discard.
+		if let Some(round) = maybe_round {
+			return peer.view.consider_vote(round, set_id) == Consider::Accept
+		}
+
+		// global message.
+		let local_view = match inner.local_view {
+			Some(ref v) => v,
+			None => return false, // cannot evaluate until we have a local view.
+		};
+
+		match GossipMessage::<Block>::decode(&mut data) {
+			Err(_) => false,
+			Ok(GossipMessage::Commit(full)) => {
+				// we only broadcast commit messages if they're for the same
+				// set the peer is in and if the commit is better than the
+				// last received by peer, additionally we make sure to only
+				// broadcast our best commit.
+				peer.view.consider_global(set_id, full.message.target_number) == Consider::Accept &&
+					Some(&full.message.target_number) == local_view.last_commit_height()
 			}
-
-			// global message.
-			let local_view = match inner.local_view {
-				Some(ref v) => v,
-				None => return false, // cannot evaluate until we have a local view.
-			};
-
-			match GossipMessage::<Block>::decode(&mut data) {
-				Err(_) => false,
-				Ok(GossipMessage::Commit(full)) => {
-					// we only broadcast commit messages if they're for the same
-					// set the peer is in and if the commit is better than the
-					// last received by peer, additionally we make sure to only
-					// broadcast our best commit.
-					peer.view.consider_global(set_id, full.message.target_number) == Consider::Accept &&
-						Some(&full.message.target_number) == local_view.last_commit_height()
-				}
-				Ok(GossipMessage::Neighbor(_)) => false,
-				Ok(GossipMessage::CatchUpRequest(_)) => false,
-				Ok(GossipMessage::CatchUp(_)) => false,
-				Ok(GossipMessage::Vote(_)) => false, // should not be the case.
-			}
-		})
+			Ok(GossipMessage::Neighbor(_)) => false,
+			Ok(GossipMessage::CatchUpRequest(_)) => false,
+			Ok(GossipMessage::CatchUp(_)) => false,
+			Ok(GossipMessage::Vote(_)) => false, // should not be the case.
+		}
 	}
 
-	fn message_expired<'a>(&'a self) -> Box<dyn FnMut(Block::Hash, &[u8]) -> bool + 'a> {
+	fn is_message_expired(&self, topic: &Block::Hash, mut data: &[u8]) -> bool {
 		let inner = self.inner.read();
-		Box::new(move |topic, mut data| {
-			// if the topic is not one of the ones that we are keeping at the moment,
-			// it is expired.
-			match inner.live_topics.topic_info(&topic) {
-				None => return true,
-				Some((Some(_), _)) => return false, // round messages don't require further checking.
-				Some((None, _)) => {},
-			};
+		// if the topic is not one of the ones that we are keeping at the moment,
+		// it is expired.
+		match inner.live_topics.topic_info(&topic) {
+			None => return true,
+			Some((Some(_), _)) => return false, // round messages don't require further checking.
+			Some((None, _)) => {},
+		};
 
-			let local_view = match inner.local_view {
-				Some(ref v) => v,
-				None => return true, // no local view means we can't evaluate or hold any topic.
-			};
+		let local_view = match inner.local_view {
+			Some(ref v) => v,
+			None => return true, // no local view means we can't evaluate or hold any topic.
+		};
 
-			// global messages -- only keep the best commit.
-			match GossipMessage::<Block>::decode(&mut data) {
-				Err(_) => true,
-				Ok(GossipMessage::Commit(full)) => match local_view.last_commit {
-					Some((number, round, set_id)) =>
-						// we expire any commit message that doesn't target the same block
-						// as our best commit or isn't from the same round and set id
-						!(full.message.target_number == number &&
-							full.round == round &&
-							full.set_id == set_id),
-					None => true,
-				},
-				Ok(_) => true,
-			}
-		})
+		// global messages -- only keep the best commit.
+		match GossipMessage::<Block>::decode(&mut data) {
+			Err(_) => true,
+			Ok(GossipMessage::Commit(full)) => match local_view.last_commit {
+				Some((number, round, set_id)) =>
+					// we expire any commit message that doesn't target the same block
+					// as our best commit or isn't from the same round and set id
+					!(full.message.target_number == number &&
+						full.round == round &&
+						full.set_id == set_id),
+				None => true,
+			},
+			Ok(_) => true,
+		}
 	}
 }
 
@@ -1807,19 +1808,18 @@ mod tests {
 		}
 
 		{
-			let mut is_expired = val.message_expired();
 			let last_kept_round = 10u64 - KEEP_RECENT_ROUNDS as u64 - 1;
 
 			// messages from old rounds are expired.
 			for round_num in 1u64..last_kept_round {
 				let topic = crate::communication::round_topic::<Block>(round_num, 1);
-				assert!(is_expired(topic, &[1, 2, 3]));
+				assert!(val.is_message_expired(&topic, &[1, 2, 3]));
 			}
 
 			// messages from not-too-old rounds are not expired.
 			for round_num in last_kept_round..10 {
 				let topic = crate::communication::round_topic::<Block>(round_num, 1);
-				assert!(!is_expired(topic, &[1, 2, 3]));
+				assert!(!val.is_message_expired(&topic, &[1, 2, 3]));
 			}
 		}
 	}
@@ -2297,16 +2297,11 @@ mod tests {
 		val.note_round(Round(9), |_, _| {});
 		val.note_round(Round(10), |_, _| {});
 
-		let mut is_expired = val.message_expired();
-
 		// we accept messages from rounds 9, 10 and 11
 		// therefore neither of those should be considered expired
 		for round in &[9, 10, 11] {
 			assert!(
-				!is_expired(
-					crate::communication::round_topic::<Block>(*round, 1),
-					&[],
-				)
+				!val.is_message_expired(&crate::communication::round_topic::<Block>(*round, 1), &[])
 			)
 		}
 	}
@@ -2342,12 +2337,11 @@ mod tests {
 			// rewind n round durations
 			val.inner.write().local_view.as_mut().unwrap().round_start =
 				Instant::now() - round_duration * num_round;
-			let mut message_allowed = val.message_allowed();
 
-			move || {
+			move |val: &GossipValidator<Block>| {
 				let mut allowed = 0;
 				for peer in peers {
-					if message_allowed(
+					if val.is_message_allowed(
 						peer,
 						MessageIntent::Broadcast,
 						&crate::communication::round_topic::<Block>(1, 0),
@@ -2360,12 +2354,15 @@ mod tests {
 			}
 		};
 
-		fn trial<F: FnMut() -> usize>(mut test: F) -> usize {
+		fn trial<F>(mut test: F, val: &GossipValidator<Block>) -> usize
+		where
+			F: FnMut(&GossipValidator<Block>) -> usize
+		{
 			let mut results = Vec::new();
 			let n = 1000;
 
 			for _ in 0..n {
-				results.push(test());
+				results.push(test(val));
 			}
 
 			let n = results.len();
@@ -2376,22 +2373,22 @@ mod tests {
 
 		// on the first attempt we will only gossip to `sqrt(authorities)`,
 		// which should average out to 5 peers after a couple of trials
-		assert_eq!(trial(test(1, &authorities)), 5);
+		assert_eq!(trial(test(1, &authorities), &val), 5);
 
 		// on the second (and subsequent attempts) we should gossip to all
 		// authorities we're connected to.
-		assert_eq!(trial(test(2, &authorities)), 30);
-		assert_eq!(trial(test(3, &authorities)), 30);
+		assert_eq!(trial(test(2, &authorities), &val), 30);
+		assert_eq!(trial(test(3, &authorities), &val), 30);
 
 		// we should only gossip to non-authorities after the third attempt
-		assert_eq!(trial(test(1, &full_nodes)), 0);
-		assert_eq!(trial(test(2, &full_nodes)), 0);
+		assert_eq!(trial(test(1, &full_nodes), &val), 0);
+		assert_eq!(trial(test(2, &full_nodes), &val), 0);
 
 		// and only to `sqrt(non-authorities)`
-		assert_eq!(trial(test(3, &full_nodes)), 5);
+		assert_eq!(trial(test(3, &full_nodes), &val), 5);
 
 		// only on the fourth attempt should we gossip to all non-authorities
-		assert_eq!(trial(test(4, &full_nodes)), 30);
+		assert_eq!(trial(test(4, &full_nodes), &val), 30);
 	}
 
 	#[test]
@@ -2412,14 +2409,12 @@ mod tests {
 			authorities.push(peer_id);
 		}
 
-		let mut message_allowed = val.message_allowed();
-
 		// since we're only connected to 5 authorities, we should never restrict
 		// sending of gossip messages, and instead just allow them to all
 		// non-authorities on the first attempt.
 		for authority in &authorities {
 			assert!(
-				message_allowed(
+				val.is_message_allowed(
 					authority,
 					MessageIntent::Broadcast,
 					&crate::communication::round_topic::<Block>(1, 0),
@@ -2453,12 +2448,11 @@ mod tests {
 		}
 
 		{
-			let mut message_allowed = val.message_allowed();
 			// since our node is not an authority we should **never** gossip any
 			// messages on the first attempt.
 			for authority in &authorities {
 				assert!(
-					!message_allowed(
+					!val.is_message_allowed(
 						authority,
 						MessageIntent::Broadcast,
 						&crate::communication::round_topic::<Block>(1, 0),
@@ -2471,12 +2465,11 @@ mod tests {
 		{
 			val.inner.write().local_view.as_mut().unwrap().round_start =
 				Instant::now() - round_duration * 4;
-			let mut message_allowed = val.message_allowed();
 			// on the fourth round duration we should allow messages to authorities
 			// (on the second we would do `sqrt(authorities)`)
 			for authority in &authorities {
 				assert!(
-					message_allowed(
+					val.is_message_allowed(
 						authority,
 						MessageIntent::Broadcast,
 						&crate::communication::round_topic::<Block>(1, 0),
@@ -2545,10 +2538,8 @@ mod tests {
 		// note the commit in the validator
 		val.note_commit_finalized(Round(1), SetId(1), 2, |_, _| {});
 
-		let mut message_allowed = val.message_allowed();
-
 		// the commit should be allowed to peer 1
-		assert!(message_allowed(
+		assert!(val.is_message_allowed(
 			&peer1,
 			MessageIntent::Broadcast,
 			&crate::communication::global_topic::<Block>(1),
@@ -2557,7 +2548,7 @@ mod tests {
 
 		// but disallowed to peer 2 since the peer is on set id 0
 		// the commit should be allowed to peer 1
-		assert!(!message_allowed(
+		assert!(!val.is_message_allowed(
 			&peer2,
 			MessageIntent::Broadcast,
 			&crate::communication::global_topic::<Block>(1),
@@ -2594,24 +2585,22 @@ mod tests {
 		// finalizing a block at height 2
 		val.note_commit_finalized(Round(1), SetId(1), 2, |_, _| {});
 
-		let mut message_expired = val.message_expired();
-
 		// a commit message for round 1 that finalizes the same height as we
 		// have observed previously should not be expired
-		assert!(!message_expired(
-			crate::communication::global_topic::<Block>(1),
+		assert!(!val.is_message_expired(
+			&crate::communication::global_topic::<Block>(1),
 			&commit(1, 1, 2),
 		));
 
 		// it should be expired if it is for a lower block
-		assert!(message_expired(
-			crate::communication::global_topic::<Block>(1),
+		assert!(val.is_message_expired(
+			&crate::communication::global_topic::<Block>(1),
 			&commit(1, 1, 1),
 		));
 
 		// or the same block height but from the previous round
-		assert!(message_expired(
-			crate::communication::global_topic::<Block>(1),
+		assert!(val.is_message_expired(
+			&crate::communication::global_topic::<Block>(1),
 			&commit(0, 1, 2),
 		));
 	}

@@ -54,4 +54,6 @@ pub enum Error {
 	Signing,
 	/// Failed to register Prometheus metric.
 	Prometheus(prometheus_endpoint::PrometheusError),
+	/// Network error.
+	Network(sc_network::ServiceError),
 }

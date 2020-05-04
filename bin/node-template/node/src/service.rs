@@ -125,7 +125,7 @@ pub fn new_full(config: Configuration) -> Result<impl AbstractService, ServiceEr
 			select_chain,
 			block_import,
 			proposer,
-			service.network(),
+			service.network().clone(),
 			inherent_data_providers.clone(),
 			force_authoring,
 			service.keystore(),
@@ -166,7 +166,7 @@ pub fn new_full(config: Configuration) -> Result<impl AbstractService, ServiceEr
 		let grandpa_config = sc_finality_grandpa::GrandpaParams {
 			config: grandpa_config,
 			link: grandpa_link,
-			network: service.network(),
+			network: service.network().clone(),
 			inherent_data_providers: inherent_data_providers.clone(),
 			telemetry_on_connect: Some(service.telemetry_on_connect_stream()),
 			voting_rule: sc_finality_grandpa::VotingRulesBuilder::default().build(),
@@ -184,7 +184,7 @@ pub fn new_full(config: Configuration) -> Result<impl AbstractService, ServiceEr
 		sc_finality_grandpa::setup_disabled_grandpa(
 			service.client(),
 			&inherent_data_providers,
-			service.network(),
+			service.network().clone(),
 		)?;
 	}
 

@@ -16,6 +16,8 @@
 
 //! Tests for the communication portion of the GRANDPA crate.
 
+use async_trait::async_trait;
+use futures::stream::BoxStream;
 use sp_utils::mpsc::{tracing_unbounded, TracingUnboundedReceiver, TracingUnboundedSender};
 use futures::prelude::*;
 use sc_network::{Event as NetworkEvent, ObservedRole, PeerId};
@@ -44,54 +46,99 @@ pub(crate) struct TestNetwork {
 	sender: TracingUnboundedSender<Event>,
 }
 
+#[async_trait]
 impl sc_network_gossip::Network<Block> for TestNetwork {
-	fn event_stream(&self) -> Pin<Box<dyn Stream<Item = NetworkEvent> + Send>> {
+	async fn event_stream(&mut self) -> Result<BoxStream<'static, sc_network::Event>, sc_network_gossip::Error> {
 		let (tx, rx) = tracing_unbounded("test");
 		let _ = self.sender.unbounded_send(Event::EventStream(tx));
-		Box::pin(rx)
+		Ok(rx.boxed())
 	}
 
-	fn report_peer(&self, who: sc_network::PeerId, cost_benefit: sc_network::ReputationChange) {
+	fn report_peer(&mut self, who: sc_network::PeerId, cost_benefit: sc_network::ReputationChange) {
 		let _ = self.sender.unbounded_send(Event::Report(who, cost_benefit));
 	}
 
-	fn disconnect_peer(&self, _: PeerId) {}
-
-	fn write_notification(&self, who: PeerId, _: ConsensusEngineId, message: Vec<u8>) {
-		let _ = self.sender.unbounded_send(Event::WriteNotification(who, message));
+	async fn disconnect_peer(&mut self, _: PeerId) -> Result<(), sc_network_gossip::Error> {
+		Ok(())
 	}
 
-	fn register_notifications_protocol(&self, _: ConsensusEngineId, _: Cow<'static, [u8]>) {}
+	async fn write_notification (
+		&mut self,
+		who: PeerId,
+		_: ConsensusEngineId,
+		message: Vec<u8>
+	) -> Result<(), sc_network_gossip::Error> {
+		let _ = self.sender.unbounded_send(Event::WriteNotification(who, message));
+		Ok(())
+	}
 
-	fn announce(&self, block: Hash, _associated_data: Vec<u8>) {
+	async fn register_notifications_protocol (
+		&mut self,
+		_: ConsensusEngineId,
+		_: Cow<'static, [u8]>
+	) -> Result<(), sc_network_gossip::Error> {
+		Ok(())
+	}
+
+	async fn announce (
+		&mut self,
+		block: Hash,
+		_associated_data: Vec<u8>
+	) -> Result<(), sc_network_gossip::Error> {
 		let _ = self.sender.unbounded_send(Event::Announce(block));
+		Ok(())
 	}
 }
 
 impl super::Network<Block> for TestNetwork {
 	fn set_sync_fork_request(
-		&self,
+		&mut self,
 		_peers: Vec<sc_network::PeerId>,
 		_hash: Hash,
 		_number: NumberFor<Block>,
 	) {}
 }
 
+#[async_trait]
 impl sc_network_gossip::ValidatorContext<Block> for TestNetwork {
-	fn broadcast_topic(&mut self, _: Hash, _: bool) { }
+	async fn broadcast_topic (
+		&mut self,
+		_: Hash,
+		_: bool
+	) -> Result<(), sc_network_gossip::Error> {
+		Ok(())
+	}
 
-	fn broadcast_message(&mut self, _: Hash, _: Vec<u8>, _: bool) {	}
+	async fn broadcast_message (
+		&mut self,
+		_: Hash,
+		_: Vec<u8>,
+		_: bool
+	) -> Result<(), sc_network_gossip::Error> {
+		Ok(())
+	}
 
-	fn send_message(&mut self, who: &sc_network::PeerId, data: Vec<u8>) {
+	async fn send_message (
+		&mut self,
+		who: &sc_network::PeerId,
+		data: Vec<u8>
+	) -> Result<(), sc_network_gossip::Error> {
 		<Self as sc_network_gossip::Network<Block>>::write_notification(
 			self,
 			who.clone(),
 			GRANDPA_ENGINE_ID,
 			data,
-		);
+		).await
 	}
 
-	fn send_topic(&mut self, _: &sc_network::PeerId, _: Hash, _: bool) { }
+	async fn send_topic (
+		&mut self,
+		_: &sc_network::PeerId,
+		_: Hash,
+		_: bool
+	) -> Result<(), sc_network_gossip::Error> {
+		Ok(())
+	}
 }
 
 pub(crate) struct Tester {
@@ -161,10 +208,7 @@ fn voter_set_state() -> SharedVoterSetState<Block> {
 }
 
 // needs to run in a tokio runtime.
-pub(crate) fn make_test_network() -> (
-	impl Future<Output = Tester>,
-	TestNetwork,
-) {
+pub(crate) fn make_test_network() -> (impl Future<Output = Tester>, TestNetwork) {
 	let (tx, rx) = tracing_unbounded("test");
 	let net = TestNetwork { sender: tx };
 
@@ -205,11 +249,28 @@ fn make_ids(keys: &[Ed25519Keyring]) -> AuthorityList {
 
 struct NoopContext;
 
+#[async_trait]
 impl sc_network_gossip::ValidatorContext<Block> for NoopContext {
-	fn broadcast_topic(&mut self, _: Hash, _: bool) { }
-	fn broadcast_message(&mut self, _: Hash, _: Vec<u8>, _: bool) { }
-	fn send_message(&mut self, _: &sc_network::PeerId, _: Vec<u8>) { }
-	fn send_topic(&mut self, _: &sc_network::PeerId, _: Hash, _: bool) { }
+	async fn broadcast_topic(&mut self, _: Hash, _: bool) -> Result<(), sc_network_gossip::Error> {
+		Ok(())
+	}
+
+	async fn broadcast_message (
+		&mut self,
+		_: Hash,
+		_: Vec<u8>,
+		_: bool
+	) -> Result<(), sc_network_gossip::Error> {
+		Ok(())
+	}
+
+	async fn send_message(&mut self, _: &PeerId, _: Vec<u8>) -> Result<(), sc_network_gossip::Error> {
+		Ok(())
+	}
+
+	async fn send_topic(&mut self, _: &PeerId, _: Hash, _: bool) -> Result<(), sc_network_gossip::Error> {
+		Ok(())
+	}
 }
 
 #[test]
@@ -356,7 +417,7 @@ fn good_commit_leads_to_relay() {
 			future::select(fut, network_bridge)
 		});
 
-	futures::executor::block_on(test);
+	async_std::task::block_on(test);
 }
 
 #[test]

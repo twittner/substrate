@@ -273,7 +273,7 @@ impl<G, E, F, L, U> TestNet<G, E, F, L, U> where
 			let service = SyncService::from(service);
 
 			executor.spawn(service.clone().map_err(|_| ()));
-			let addr = addr.with(multiaddr::Protocol::P2p(service.get().network().local_peer_id().clone().into()));
+			let addr = addr.with(multiaddr::Protocol::P2p(service.get().network_mut().local_peer_id().clone().into()));
 			self.authority_nodes.push((self.nodes, service, user_data, addr));
 			self.nodes += 1;
 		}
@@ -289,7 +289,7 @@ impl<G, E, F, L, U> TestNet<G, E, F, L, U> where
 			let service = SyncService::from(service);
 
 			executor.spawn(service.clone().map_err(|_| ()));
-			let addr = addr.with(multiaddr::Protocol::P2p(service.get().network().local_peer_id().clone().into()));
+			let addr = addr.with(multiaddr::Protocol::P2p(service.get().network_mut().local_peer_id().clone().into()));
 			self.full_nodes.push((self.nodes, service, user_data, addr));
 			self.nodes += 1;
 		}
@@ -304,7 +304,7 @@ impl<G, E, F, L, U> TestNet<G, E, F, L, U> where
 			let service = SyncService::from(light(node_config).expect("Error creating test node service"));
 
 			executor.spawn(service.clone().map_err(|_| ()));
-			let addr = addr.with(multiaddr::Protocol::P2p(service.get().network().local_peer_id().clone().into()));
+			let addr = addr.with(multiaddr::Protocol::P2p(service.get().network_mut().local_peer_id().clone().into()));
 			self.light_nodes.push((self.nodes, service, addr));
 			self.nodes += 1;
 		}
@@ -347,22 +347,26 @@ pub fn connectivity<G, E, Fb, F, Lb, L>(
 				30400,
 			);
 			info!("Checking star topology");
-			let first_address = network.full_nodes[0].3.clone();
-			for (_, service, _, _) in network.full_nodes.iter().skip(1) {
-				service.get().network().add_reserved_peer(first_address.to_string())
-					.expect("Error adding reserved peer");
-			}
-			for (_, service, _) in network.light_nodes.iter() {
-				service.get().network().add_reserved_peer(first_address.to_string())
-					.expect("Error adding reserved peer");
-			}
+			futures::executor::block_on(async {
+				let first_address = network.full_nodes[0].3.clone();
+				for (_, service, _, _) in network.full_nodes.iter().skip(1) {
+					service.get().network_mut().add_reserved_peer(first_address.to_string())
+						.await
+						.expect("Error adding reserved peer");
+				}
+				for (_, service, _) in network.light_nodes.iter() {
+					service.get().network_mut().add_reserved_peer(first_address.to_string())
+						.await
+						.expect("Error adding reserved peer");
+				}
 
-			network.run_until_all_full(
-				move |_index, service| service.get().network().num_connected()
-					== expected_full_connections,
-				move |_index, service| service.get().network().num_connected()
-					== expected_light_connections,
-			);
+				network.run_until_all_full(
+					move |_index, service| service.get().network_mut().num_connected()
+						== expected_full_connections,
+					move |_index, service| service.get().network_mut().num_connected()
+						== expected_light_connections,
+				);
+			});
 
 			network.runtime
 		};
@@ -385,30 +389,34 @@ pub fn connectivity<G, E, Fb, F, Lb, L>(
 				30400,
 			);
 			info!("Checking linked topology");
-			let mut address = network.full_nodes[0].3.clone();
-			let max_nodes = std::cmp::max(NUM_FULL_NODES, NUM_LIGHT_NODES);
-			for i in 0..max_nodes {
-				if i != 0 {
-					if let Some((_, service, _, node_id)) = network.full_nodes.get(i) {
-						service.get().network().add_reserved_peer(address.to_string())
+			futures::executor::block_on(async {
+				let mut address = network.full_nodes[0].3.clone();
+				let max_nodes = std::cmp::max(NUM_FULL_NODES, NUM_LIGHT_NODES);
+				for i in 0..max_nodes {
+					if i != 0 {
+						if let Some((_, service, _, node_id)) = network.full_nodes.get(i) {
+							service.get().network_mut().add_reserved_peer(address.to_string())
+								.await
+								.expect("Error adding reserved peer");
+							address = node_id.clone();
+						}
+					}
+
+					if let Some((_, service, node_id)) = network.light_nodes.get(i) {
+						service.get().network_mut().add_reserved_peer(address.to_string())
+							.await
 							.expect("Error adding reserved peer");
 						address = node_id.clone();
 					}
 				}
 
-				if let Some((_, service, node_id)) = network.light_nodes.get(i) {
-					service.get().network().add_reserved_peer(address.to_string())
-						.expect("Error adding reserved peer");
-					address = node_id.clone();
-				}
-			}
-
-			network.run_until_all_full(
-				move |_index, service| service.get().network().num_connected()
-					== expected_full_connections,
-				move |_index, service| service.get().network().num_connected()
-					== expected_light_connections,
-			);
+				network.run_until_all_full(
+					move |_index, service| service.get().network_mut().num_connected()
+						== expected_full_connections,
+					move |_index, service| service.get().network_mut().num_connected()
+						== expected_light_connections,
+				);
+			});
 		}
 		temp.close().expect("Error removing temp dir");
 	}
@@ -460,12 +468,18 @@ pub fn sync<G, E, Fb, F, Lb, L, B, ExF, U>(
 	};
 
 	info!("Running sync");
-	for (_, service, _, _) in network.full_nodes.iter().skip(1) {
-		service.get().network().add_reserved_peer(first_address.to_string()).expect("Error adding reserved peer");
-	}
-	for (_, service, _) in network.light_nodes.iter() {
-		service.get().network().add_reserved_peer(first_address.to_string()).expect("Error adding reserved peer");
-	}
+	futures::executor::block_on(async {
+		for (_, service, _, _) in network.full_nodes.iter().skip(1) {
+			service.get().network_mut().add_reserved_peer(first_address.to_string())
+				.await
+				.expect("Error adding reserved peer");
+		}
+		for (_, service, _) in network.light_nodes.iter() {
+			service.get().network_mut().add_reserved_peer(first_address.to_string())
+				.await
+				.expect("Error adding reserved peer");
+		}
+	});
 	network.run_until_all_full(
 		|_index, service|
 			service.get().client().info().best_number == (NUM_BLOCKS as u32).into(),
@@ -518,15 +532,23 @@ pub fn consensus<G, E, Fb, F, Lb, L>(
 
 	info!("Checking consensus");
 	let first_address = network.authority_nodes[0].3.clone();
-	for (_, service, _, _) in network.full_nodes.iter() {
-		service.get().network().add_reserved_peer(first_address.to_string()).expect("Error adding reserved peer");
-	}
-	for (_, service, _) in network.light_nodes.iter() {
-		service.get().network().add_reserved_peer(first_address.to_string()).expect("Error adding reserved peer");
-	}
-	for (_, service, _, _) in network.authority_nodes.iter().skip(1) {
-		service.get().network().add_reserved_peer(first_address.to_string()).expect("Error adding reserved peer");
-	}
+	futures::executor::block_on(async {
+		for (_, service, _, _) in network.full_nodes.iter() {
+			service.get().network_mut().add_reserved_peer(first_address.to_string())
+				.await
+				.expect("Error adding reserved peer");
+		}
+		for (_, service, _) in network.light_nodes.iter() {
+			service.get().network_mut().add_reserved_peer(first_address.to_string())
+				.await
+				.expect("Error adding reserved peer");
+		}
+		for (_, service, _, _) in network.authority_nodes.iter().skip(1) {
+			service.get().network_mut().add_reserved_peer(first_address.to_string())
+				.await
+				.expect("Error adding reserved peer");
+		}
+	});
 	network.run_until_all_full(
 		|_index, service|
 			service.get().client().info().finalized_number >= (NUM_BLOCKS as u32 / 2).into(),
@@ -543,12 +565,18 @@ pub fn consensus<G, E, Fb, F, Lb, L>(
 		// the type of the closure cannot be inferred.
 		(0..0).map(|_| (String::new(), { |cfg| full_builder(cfg).map(|s| (s, ())) })),
 	);
-	for (_, service, _, _) in network.full_nodes.iter() {
-		service.get().network().add_reserved_peer(first_address.to_string()).expect("Error adding reserved peer");
-	}
-	for (_, service, _) in network.light_nodes.iter() {
-		service.get().network().add_reserved_peer(first_address.to_string()).expect("Error adding reserved peer");
-	}
+	futures::executor::block_on(async {
+		for (_, service, _, _) in network.full_nodes.iter() {
+			service.get().network_mut().add_reserved_peer(first_address.to_string())
+				.await
+				.expect("Error adding reserved peer");
+		}
+		for (_, service, _) in network.light_nodes.iter() {
+			service.get().network_mut().add_reserved_peer(first_address.to_string())
+				.await
+				.expect("Error adding reserved peer");
+		}
+	});
 	network.run_until_all_full(
 		|_index, service|
 			service.get().client().info().finalized_number >= (NUM_BLOCKS as u32).into(),

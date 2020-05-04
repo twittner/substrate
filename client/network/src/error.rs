@@ -17,27 +17,25 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 //! Substrate network possible errors.
 
+use futures::channel::mpsc::SendError;
 use libp2p::{PeerId, Multiaddr};
-
-use std::fmt;
+use thiserror::Error;
 
 /// Result type alias for the network.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Error type for the network.
-#[derive(derive_more::Display, derive_more::From)]
+#[derive(Debug, Error)]
 pub enum Error {
 	/// Io error
-	Io(std::io::Error),
+	#[error("i/o error: {0}")]
+	Io(#[from] std::io::Error),
+
 	/// Client error
-	Client(sp_blockchain::Error),
+	#[error("client error: {0}")]
+	Client(#[from] sp_blockchain::Error),
 	/// The same bootnode (based on address) is registered with two different peer ids.
-	#[display(
-		fmt = "The same bootnode (`{}`) is registered with two different peer ids: `{}` and `{}`",
-		address,
-		first_id,
-		second_id,
-	)]
+	#[error("The same bootnode (`{address}`) is registered with two different peer ids: `{first_id}` and `{second_id}`")]
 	DuplicateBootnode {
 		/// The address of the bootnode.
 		address: Multiaddr,
@@ -47,23 +45,23 @@ pub enum Error {
 		second_id: PeerId,
 	},
 	/// Prometheus metrics error.
-	Prometheus(prometheus_endpoint::PrometheusError)
+	#[error("prometheus error: {0}")]
+	Prometheus(#[from] prometheus_endpoint::PrometheusError),
 }
 
-// Make `Debug` use the `Display` implementation.
-impl fmt::Debug for Error {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		fmt::Display::fmt(self, f)
-	}
+/// TODO
+#[derive(Debug, Error)]
+pub enum ServiceError {
+	/// The network worker no longer exists.
+	#[error("network worker is gone")]
+	NetworkWorkerGone,
+	/// Failed to parse a multi address.
+	#[error("parse failure: {0}")]
+	ParseError(#[from] crate::config::ParseErr)
 }
 
-impl std::error::Error for Error {
-	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-		match self {
-			Error::Io(ref err) => Some(err),
-			Error::Client(ref err) => Some(err),
-			Error::DuplicateBootnode { .. } => None,
-			Error::Prometheus(ref err) => Some(err),
-		}
+impl From<SendError> for ServiceError {
+	fn from(_: SendError) -> Self {
+		ServiceError::NetworkWorkerGone
 	}
 }

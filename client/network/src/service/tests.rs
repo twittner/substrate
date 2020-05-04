@@ -33,7 +33,7 @@ type TestNetworkService = NetworkService<
 /// > **Note**: We return the events stream in order to not possibly lose events between the
 /// >			construction of the service and the moment the events stream is grabbed.
 fn build_test_full_node(config: config::NetworkConfiguration)
-	-> (Arc<TestNetworkService>, impl Stream<Item = Event>)
+	-> (TestNetworkService, impl Stream<Item = Event>)
 {
 	let client = Arc::new(
 		TestClientBuilder::with_default_backend()
@@ -108,8 +108,8 @@ fn build_test_full_node(config: config::NetworkConfiguration)
 	})
 	.unwrap();
 
-	let service = worker.service().clone();
-	let event_stream = service.event_stream("test");
+	let mut service = worker.service().clone();
+	let event_stream = futures::executor::block_on(service.event_stream("test")).unwrap();
 
 	async_std::task::spawn(async move {
 		futures::pin_mut!(worker);
@@ -124,7 +124,7 @@ const ENGINE_ID: sp_runtime::ConsensusEngineId = *b"foo\0";
 /// Builds two nodes and their associated events stream.
 /// The nodes are connected together and have the `ENGINE_ID` protocol registered.
 fn build_nodes_one_proto()
-	-> (Arc<TestNetworkService>, impl Stream<Item = Event>, Arc<TestNetworkService>, impl Stream<Item = Event>)
+	-> (TestNetworkService, impl Stream<Item = Event>, TestNetworkService, impl Stream<Item = Event>)
 {
 	let listen_addr = config::build_multiaddr![Memory(rand::random::<u64>())];
 
@@ -153,17 +153,19 @@ fn notifications_state_consistent() {
 	// Runs two nodes and ensures that events are propagated out of the API in a consistent
 	// correct order, which means no notification received on a closed substream.
 
-	let (node1, mut events_stream1, node2, mut events_stream2) = build_nodes_one_proto();
-
-	// Write some initial notifications that shouldn't get through.
-	for _ in 0..(rand::random::<u8>() % 5) {
-		node1.write_notification(node2.local_peer_id().clone(), ENGINE_ID, b"hello world".to_vec());
-	}
-	for _ in 0..(rand::random::<u8>() % 5) {
-		node2.write_notification(node1.local_peer_id().clone(), ENGINE_ID, b"hello world".to_vec());
-	}
+	let (mut node1, mut events_stream1, mut node2, mut events_stream2) = build_nodes_one_proto();
 
 	async_std::task::block_on(async move {
+		// Write some initial notifications that shouldn't get through.
+		for _ in 0..(rand::random::<u8>() % 5) {
+			node1.write_notification(node2.local_peer_id().clone(), ENGINE_ID, b"hello world".to_vec())
+				.await?
+		}
+		for _ in 0..(rand::random::<u8>() % 5) {
+			node2.write_notification(node1.local_peer_id().clone(), ENGINE_ID, b"hello world".to_vec())
+				.await?
+		}
+
 		// True if we have an active substream from node1 to node2.
 		let mut node1_to_node2_open = false;
 		// True if we have an active substream from node2 to node1.
@@ -183,18 +185,20 @@ fn notifications_state_consistent() {
 			// Start by sending a notification from node1 to node2 and vice-versa. Part of the
 			// test consists in ensuring that notifications get ignored if the stream isn't open.
 			if rand::random::<u8>() % 5 >= 3 {
-				node1.write_notification(node2.local_peer_id().clone(), ENGINE_ID, b"hello world".to_vec());
+				node1.write_notification(node2.local_peer_id().clone(), ENGINE_ID, b"hello world".to_vec())
+					.await?
 			}
 			if rand::random::<u8>() % 5 >= 3 {
-				node2.write_notification(node1.local_peer_id().clone(), ENGINE_ID, b"hello world".to_vec());
+				node2.write_notification(node1.local_peer_id().clone(), ENGINE_ID, b"hello world".to_vec())
+					.await?
 			}
 
 			// Also randomly disconnect the two nodes from time to time.
 			if rand::random::<u8>() % 20 == 0 {
-				node1.disconnect_peer(node2.local_peer_id().clone());
+				node1.disconnect_peer(node2.local_peer_id().clone()).await?
 			}
 			if rand::random::<u8>() % 20 == 0 {
-				node2.disconnect_peer(node1.local_peer_id().clone());
+				node2.disconnect_peer(node1.local_peer_id().clone()).await?
 			}
 
 			// Grab next event from either `events_stream1` or `events_stream2`.
@@ -249,7 +253,7 @@ fn notifications_state_consistent() {
 							node2.local_peer_id().clone(),
 							ENGINE_ID,
 							b"hello world".to_vec()
-						);
+						).await?
 					}
 				}
 				future::Either::Right(Event::NotificationsReceived { remote, .. }) => {
@@ -260,7 +264,7 @@ fn notifications_state_consistent() {
 							node1.local_peer_id().clone(),
 							ENGINE_ID,
 							b"hello world".to_vec()
-						);
+						).await?
 					}
 				}
 
@@ -269,5 +273,6 @@ fn notifications_state_consistent() {
 				future::Either::Right(Event::Dht(_)) => {}
 			};
 		}
-	});
+		Ok::<_, crate::ServiceError>(())
+	}).unwrap();
 }

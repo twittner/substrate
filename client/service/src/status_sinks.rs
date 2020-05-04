@@ -60,10 +60,6 @@ impl<T> StatusSinks<T> {
 	/// This function doesn't return anything, but it should be treated as if it implicitly
 	/// returns `Poll::Pending`. In particular, it should be called again when the task
 	/// is waken up.
-	///
-	/// # Panic
-	///
-	/// Panics if not called within the context of a task.
 	pub fn poll(&mut self, cx: &mut Context, mut status_grab: impl FnMut() -> T) {
 		loop {
 			match Pin::new(&mut self.entries).poll_next(cx) {

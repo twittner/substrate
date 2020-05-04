@@ -19,7 +19,7 @@
 //! Manages communication between them.
 
 #![warn(missing_docs)]
-#![recursion_limit="128"]
+#![recursion_limit="1024"]
 
 pub mod config;
 #[macro_use]
@@ -46,6 +46,7 @@ use parking_lot::Mutex;
 
 use client::Client;
 use futures::{
+	future,
 	Future, FutureExt, Stream, StreamExt,
 	compat::*,
 	sink::SinkExt,
@@ -108,7 +109,7 @@ pub struct Service<TBl, TCl, TSc, TNetStatus, TNet, TTxPool, TOc> {
 	client: Arc<TCl>,
 	task_manager: TaskManager,
 	select_chain: Option<TSc>,
-	network: Arc<TNet>,
+	network: TNet,
 	/// Sinks to propagate network status updates.
 	/// For each element, every time the `Interval` fires we push an element on the sender.
 	network_status_sinks: Arc<Mutex<status_sinks::StatusSinks<(TNetStatus, NetworkState)>>>,
@@ -194,8 +195,10 @@ pub trait AbstractService: Future<Output = Result<(), Error>> + Send + Unpin + S
 	fn select_chain(&self) -> Option<Self::SelectChain>;
 
 	/// Get shared network instance.
-	fn network(&self)
-		-> Arc<NetworkService<Self::Block, <Self::Block as BlockT>::Hash>>;
+	fn network(&self) -> &NetworkService<Self::Block, <Self::Block as BlockT>::Hash>;
+
+	/// Get unique network instance.
+	fn network_mut(&mut self) -> &mut NetworkService<Self::Block, <Self::Block as BlockT>::Hash>;
 
 	/// Returns a receiver that periodically receives a status of the network.
 	fn network_status(&self, interval: Duration) -> TracingUnboundedReceiver<(NetworkStatus<Self::Block>, NetworkState)>;
@@ -286,10 +289,12 @@ where
 		self.select_chain.clone()
 	}
 
-	fn network(&self)
-		-> Arc<NetworkService<Self::Block, <Self::Block as BlockT>::Hash>>
-	{
-		self.network.clone()
+	fn network(&self) -> &NetworkService<Self::Block, <Self::Block as BlockT>::Hash> {
+		&self.network
+	}
+
+	fn network_mut(&mut self) -> &mut NetworkService<Self::Block, <Self::Block as BlockT>::Hash> {
+		&mut self.network
 	}
 
 	fn network_status(&self, interval: Duration) -> TracingUnboundedReceiver<(NetworkStatus<Self::Block>, NetworkState)> {
@@ -361,129 +366,133 @@ fn build_network_future<
 	should_have_peers: bool,
 	announce_imported_blocks: bool,
 ) -> impl Future<Output = ()> {
-	let mut imported_blocks_stream = client.import_notification_stream().fuse();
-	let mut finality_notification_stream = client.finality_notification_stream().fuse();
 
-	futures::future::poll_fn(move |cx| {
-		let before_polling = Instant::now();
 
-		// We poll `imported_blocks_stream`.
-		while let Poll::Ready(Some(notification)) = Pin::new(&mut imported_blocks_stream).poll_next(cx) {
-			if announce_imported_blocks {
-				network.service().announce_block(notification.hash, Vec::new());
-			}
-		}
+	async move {
+		let mut imported_blocks_stream = client.import_notification_stream().fuse();
+		let mut finality_notification_stream = client.finality_notification_stream().fuse();
 
-		// We poll `finality_notification_stream`, but we only take the last event.
-		let mut last = None;
-		while let Poll::Ready(Some(item)) = Pin::new(&mut finality_notification_stream).poll_next(cx) {
-			last = Some(item);
-		}
-		if let Some(notification) = last {
-			network.on_block_finalized(notification.hash, notification.header);
-		}
+		loop {
+			let before_polling = Instant::now();
 
-		// Poll the RPC requests and answer them.
-		while let Poll::Ready(Some(request)) = Pin::new(&mut rpc_rx).poll_next(cx) {
-			match request {
-				sc_rpc::system::Request::Health(sender) => {
-					let _ = sender.send(sc_rpc::system::Health {
-						peers: network.peers_debug_info().len(),
-						is_syncing: network.service().is_major_syncing(),
-						should_have_peers,
-					});
-				},
-				sc_rpc::system::Request::LocalPeerId(sender) => {
-					let _ = sender.send(network.local_peer_id().to_base58());
-				},
-				sc_rpc::system::Request::LocalListenAddresses(sender) => {
-					let peer_id = network.local_peer_id().clone().into();
-					let p2p_proto_suffix = sc_network::multiaddr::Protocol::P2p(peer_id);
-					let addresses = network.listen_addresses()
-						.map(|addr| addr.clone().with(p2p_proto_suffix.clone()).to_string())
-						.collect();
-					let _ = sender.send(addresses);
-				},
-				sc_rpc::system::Request::Peers(sender) => {
-					let _ = sender.send(network.peers_debug_info().into_iter().map(|(peer_id, p)|
-						sc_rpc::system::PeerInfo {
-							peer_id: peer_id.to_base58(),
-							roles: format!("{:?}", p.roles),
-							protocol_version: p.protocol_version,
-							best_hash: p.best_hash,
-							best_number: p.best_number,
-						}
-					).collect());
-				}
-				sc_rpc::system::Request::NetworkState(sender) => {
-					if let Some(network_state) = serde_json::to_value(&network.network_state()).ok() {
-						let _ = sender.send(network_state);
+			futures::select! {
+				notification = imported_blocks_stream.next() => if let Some(notif) = notification {
+					if announce_imported_blocks {
+						network.service_mut().announce_block(notif.hash, Vec::new()).await.unwrap() // TODO
 					}
-				}
-				sc_rpc::system::Request::NetworkAddReservedPeer(peer_addr, sender) => {
-					let x = network.add_reserved_peer(peer_addr)
-						.map_err(sc_rpc::system::error::Error::MalformattedPeerArg);
-					let _ = sender.send(x);
-				}
-				sc_rpc::system::Request::NetworkRemoveReservedPeer(peer_id, sender) => {
-					let _ = match peer_id.parse::<PeerId>() {
-						Ok(peer_id) => {
-							network.remove_reserved_peer(peer_id);
-							sender.send(Ok(()))
+				},
+
+				notification = finality_notification_stream.next() => if let Some(notif) = notification { // TODO: Only take last "ready" notification
+					network.on_block_finalized(notif.hash, notif.header)
+				},
+
+				request = rpc_rx.next() => if let Some(request) = request {
+					match request {
+						sc_rpc::system::Request::Health(sender) => {
+							let _ = sender.send(sc_rpc::system::Health {
+								peers: network.peers_debug_info().len(),
+								is_syncing: network.service().is_major_syncing(),
+								should_have_peers,
+							});
+						},
+						sc_rpc::system::Request::LocalPeerId(sender) => {
+							let _ = sender.send(network.local_peer_id().to_base58());
+						},
+						sc_rpc::system::Request::LocalListenAddresses(sender) => {
+							let peer_id = network.local_peer_id().clone().into();
+							let p2p_proto_suffix = sc_network::multiaddr::Protocol::P2p(peer_id);
+							let addresses = network.listen_addresses()
+								.map(|addr| addr.clone().with(p2p_proto_suffix.clone()).to_string())
+								.collect();
+							let _ = sender.send(addresses);
+						},
+						sc_rpc::system::Request::Peers(sender) => {
+							let _ = sender.send(network.peers_debug_info().into_iter().map(|(peer_id, p)|
+								sc_rpc::system::PeerInfo {
+									peer_id: peer_id.to_base58(),
+									roles: format!("{:?}", p.roles),
+									protocol_version: p.protocol_version,
+									best_hash: p.best_hash,
+									best_number: p.best_number,
+								}
+							).collect());
 						}
-						Err(e) => sender.send(Err(sc_rpc::system::error::Error::MalformattedPeerArg(
-							e.to_string(),
-						))),
-					};
+						sc_rpc::system::Request::NetworkState(sender) => {
+							if let Some(network_state) = serde_json::to_value(&network.network_state()).ok() {
+								let _ = sender.send(network_state);
+							}
+						}
+						sc_rpc::system::Request::NetworkAddReservedPeer(peer_addr, sender) => {
+							let x = network.service_mut().add_reserved_peer(peer_addr).await
+								.map_err(|e| {
+									sc_rpc::system::error::Error::MalformattedPeerArg(e.to_string())
+								});
+							let _ = sender.send(x);
+						}
+						sc_rpc::system::Request::NetworkRemoveReservedPeer(peer_id, sender) => {
+							let _ = match peer_id.parse::<PeerId>() {
+								Ok(peer_id) => {
+									network.service().remove_reserved_peer(peer_id);
+									sender.send(Ok(()))
+								}
+								Err(e) => sender.send(Err(sc_rpc::system::error::Error::MalformattedPeerArg(
+									e.to_string(),
+								))),
+							};
+						}
+						sc_rpc::system::Request::NodeRoles(sender) => {
+							use sc_rpc::system::NodeRole;
+
+							let node_role = match role {
+								Role::Authority { .. } => NodeRole::Authority,
+								Role::Light => NodeRole::LightClient,
+								Role::Full => NodeRole::Full,
+								Role::Sentry { .. } => NodeRole::Sentry,
+							};
+
+							let _ = sender.send(vec![node_role]);
+						}
+					}
+				},
+
+				result = network => match result {
+					Err(e) => {
+						warn!(target: "service", "Error in network: {:?}", e);
+						return ()
+					}
+					Ok(()) => return ()
 				}
-				sc_rpc::system::Request::NodeRoles(sender) => {
-					use sc_rpc::system::NodeRole;
+			}
 
-					let node_role = match role {
-						Role::Authority { .. } => NodeRole::Authority,
-						Role::Light => NodeRole::LightClient,
-						Role::Full => NodeRole::Full,
-						Role::Sentry { .. } => NodeRole::Sentry,
+			// Interval report for the external API.
+			future::poll_fn(|cx| {
+				status_sinks.lock().poll(cx, || {
+					let status = NetworkStatus {
+						sync_state: network.sync_state(),
+						best_seen_block: network.best_seen_block(),
+						num_sync_peers: network.num_sync_peers(),
+						num_connected_peers: network.num_connected_peers(),
+						num_active_peers: network.num_active_peers(),
+						average_download_per_sec: network.average_download_per_sec(),
+						average_upload_per_sec: network.average_upload_per_sec(),
 					};
+					let state = network.network_state();
+					(status, state)
+				});
+				Poll::Ready(())
+			})
+			.await;
 
-					let _ = sender.send(vec![node_role]);
-				}
-			};
+			// Now some diagnostic for performances.
+			let polling_dur = before_polling.elapsed();
+			log!(
+				target: "service",
+				if polling_dur >= Duration::from_secs(1) { Level::Warn } else { Level::Trace },
+				"⚠️  Polling the network future took {:?}",
+				polling_dur
+			)
 		}
-
-		// Interval report for the external API.
-		status_sinks.lock().poll(cx, || {
-			let status = NetworkStatus {
-				sync_state: network.sync_state(),
-				best_seen_block: network.best_seen_block(),
-				num_sync_peers: network.num_sync_peers(),
-				num_connected_peers: network.num_connected_peers(),
-				num_active_peers: network.num_active_peers(),
-				average_download_per_sec: network.average_download_per_sec(),
-				average_upload_per_sec: network.average_upload_per_sec(),
-			};
-			let state = network.network_state();
-			(status, state)
-		});
-
-		// Main network polling.
-		if let Poll::Ready(Ok(())) = Pin::new(&mut network).poll(cx).map_err(|err| {
-			warn!(target: "service", "Error in network: {:?}", err);
-		}) {
-			return Poll::Ready(());
-		}
-
-		// Now some diagnostic for performances.
-		let polling_dur = before_polling.elapsed();
-		log!(
-			target: "service",
-			if polling_dur >= Duration::from_secs(1) { Level::Warn } else { Level::Trace },
-			"⚠️  Polling the network future took {:?}",
-			polling_dur
-		);
-
-		Poll::Pending
-	})
+	}
 }
 
 /// Overview status of the network.

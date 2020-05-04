@@ -54,8 +54,9 @@
 //! included in the newly-finalized chain.
 
 #![warn(missing_docs)]
+#![recursion_limit="256"]
 
-use futures::prelude::*;
+use futures::{executor::block_on, prelude::*};
 use futures::StreamExt;
 use log::{debug, info};
 use sc_client_api::{
@@ -350,14 +351,14 @@ pub(crate) trait BlockSyncRequester<Block: BlockT> {
 	/// If the given vector of peers is empty then the underlying implementation
 	/// should make a best effort to fetch the block from any peers it is
 	/// connected to (NOTE: this assumption will change in the future #3629).
-	fn set_sync_fork_request(&self, peers: Vec<sc_network::PeerId>, hash: Block::Hash, number: NumberFor<Block>);
+	fn set_sync_fork_request(&mut self, peers: Vec<sc_network::PeerId>, hash: Block::Hash, number: NumberFor<Block>);
 }
 
 impl<Block, Network> BlockSyncRequester<Block> for NetworkBridge<Block, Network> where
 	Block: BlockT,
 	Network: NetworkT<Block>,
 {
-	fn set_sync_fork_request(&self, peers: Vec<sc_network::PeerId>, hash: Block::Hash, number: NumberFor<Block>) {
+	fn set_sync_fork_request(&mut self, peers: Vec<sc_network::PeerId>, hash: Block::Hash, number: NumberFor<Block>) {
 		NetworkBridge::set_sync_fork_request(self, peers, hash, number)
 	}
 }
@@ -1062,7 +1063,7 @@ where
 pub fn setup_disabled_grandpa<Block: BlockT, Client, N>(
 	client: Arc<Client>,
 	inherent_data_providers: &InherentDataProviders,
-	network: N,
+	mut network: N,
 ) -> Result<(), sp_consensus::Error> where
 	N: NetworkT<Block> + Send + Clone + 'static,
 	Client: HeaderBackend<Block> + 'static,
@@ -1075,10 +1076,13 @@ pub fn setup_disabled_grandpa<Block: BlockT, Client, N>(
 	// We register the GRANDPA protocol so that we don't consider it an anomaly
 	// to receive GRANDPA messages on the network. We don't process the
 	// messages.
-	network.register_notifications_protocol(
-		communication::GRANDPA_ENGINE_ID,
-		From::from(communication::GRANDPA_PROTOCOL_NAME),
-	);
+	block_on(async {
+		network.register_notifications_protocol(
+			communication::GRANDPA_ENGINE_ID,
+			From::from(communication::GRANDPA_PROTOCOL_NAME),
+		)
+		.await.unwrap()
+	});
 
 	Ok(())
 }

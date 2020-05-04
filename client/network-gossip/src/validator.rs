@@ -15,6 +15,9 @@
 
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+use async_trait::async_trait;
+use crate::Error;
 use sc_network::{ObservedRole, PeerId};
 use sp_runtime::traits::Block as BlockT;
 
@@ -36,27 +39,33 @@ pub trait Validator<B: BlockT>: Send + Sync {
 		data: &[u8]
 	) -> ValidationResult<B::Hash>;
 
-	/// Produce a closure for validating messages on a given topic.
-	fn message_expired<'a>(&'a self) -> Box<dyn FnMut(B::Hash, &[u8]) -> bool + 'a> {
-		Box::new(move |_topic, _data| false)
+	/// TODO
+	fn is_message_expired(&self, _topic: &B::Hash, _data: &[u8]) -> bool {
+		false
 	}
 
-	/// Produce a closure for filtering egress messages.
-	fn message_allowed<'a>(&'a self) -> Box<dyn FnMut(&PeerId, MessageIntent, &B::Hash, &[u8]) -> bool + 'a> {
-		Box::new(move |_who, _intent, _topic, _data| true)
+	/// TODO
+	fn is_message_allowed(&self, _who: &PeerId, _intent: MessageIntent, _topic: &B::Hash, _data: &[u8]) -> bool {
+		true
 	}
 }
 
 /// Validation context. Allows reacting to incoming messages by sending out further messages.
+#[async_trait]
 pub trait ValidatorContext<B: BlockT> {
 	/// Broadcast all messages with given topic to peers that do not have it yet.
-	fn broadcast_topic(&mut self, topic: B::Hash, force: bool);
+	async fn broadcast_topic(&mut self, topic: B::Hash, force: bool) -> Result<(), Error>;
 	/// Broadcast a message to all peers that have not received it previously.
-	fn broadcast_message(&mut self, topic: B::Hash, message: Vec<u8>, force: bool);
+	async fn broadcast_message (
+		&mut self,
+		topic: B::Hash,
+		message: Vec<u8>,
+		force: bool
+	) -> Result<(), Error>;
 	/// Send addressed message to a peer.
-	fn send_message(&mut self, who: &PeerId, message: Vec<u8>);
+	async fn send_message(&mut self, who: &PeerId, message: Vec<u8>) -> Result<(), Error>;
 	/// Send all messages with given topic to a peer.
-	fn send_topic(&mut self, who: &PeerId, topic: B::Hash, force: bool);
+	async fn send_topic(&mut self, who: &PeerId, topic: B::Hash, force: bool) -> Result<(), Error>;
 }
 
 /// The reason for sending out the message.
@@ -94,11 +103,11 @@ impl<B: BlockT> Validator<B> for DiscardAll {
 		ValidationResult::Discard
 	}
 
-	fn message_expired<'a>(&'a self) -> Box<dyn FnMut(B::Hash, &[u8]) -> bool + 'a> {
-		Box::new(move |_topic, _data| true)
+	fn is_message_expired(&self, _topic: &B::Hash, _data: &[u8]) -> bool {
+		true
 	}
 
-	fn message_allowed<'a>(&'a self) -> Box<dyn FnMut(&PeerId, MessageIntent, &B::Hash, &[u8]) -> bool + 'a> {
-		Box::new(move |_who, _intent, _topic, _data| false)
+	fn is_message_allowed(&self, _who: &PeerId, _intent: MessageIntent, _topic: &B::Hash, _data: &[u8]) -> bool {
+		false
 	}
 }

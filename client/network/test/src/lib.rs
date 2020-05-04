@@ -232,31 +232,31 @@ impl<D> Peer<D> {
 	}
 
 	/// Request a justification for the given block.
-	pub fn request_justification(&self, hash: &<Block as BlockT>::Hash, number: NumberFor<Block>) {
-		self.network.service().request_justification(hash, number);
+	pub async fn request_justification(&mut self, hash: &<Block as BlockT>::Hash, number: NumberFor<Block>) {
+		self.network.service_mut().request_justification(hash, number).await.unwrap()
 	}
 
 	/// Announces an important block on the network.
-	pub fn announce_block(&self, hash: <Block as BlockT>::Hash, data: Vec<u8>) {
-		self.network.service().announce_block(hash, data);
+	pub async fn announce_block(&mut self, hash: <Block as BlockT>::Hash, data: Vec<u8>) {
+		self.network.service_mut().announce_block(hash, data).await.unwrap()
 	}
 
 	/// Request explicit fork sync.
-	pub fn set_sync_fork_request(&self, peers: Vec<PeerId>, hash: <Block as BlockT>::Hash, number: NumberFor<Block>) {
-		self.network.service().set_sync_fork_request(peers, hash, number);
+	pub async fn set_sync_fork_request(&mut self, peers: Vec<PeerId>, hash: <Block as BlockT>::Hash, number: NumberFor<Block>) {
+		self.network.service_mut().set_sync_fork_request(peers, hash, number).await.unwrap()
 	}
 
 	/// Add blocks to the peer -- edit the block before adding
-	pub fn generate_blocks<F>(&mut self, count: usize, origin: BlockOrigin, edit_block: F) -> H256
+	pub async fn generate_blocks<F>(&mut self, count: usize, origin: BlockOrigin, edit_block: F) -> H256
 		where F: FnMut(BlockBuilder<Block, PeersFullClient, substrate_test_runtime_client::Backend>) -> Block
 	{
 		let best_hash = self.client.info().best_hash;
-		self.generate_blocks_at(BlockId::Hash(best_hash), count, origin, edit_block, false)
+		self.generate_blocks_at(BlockId::Hash(best_hash), count, origin, edit_block, false).await
 	}
 
 	/// Add blocks to the peer -- edit the block before adding. The chain will
 	/// start at the given block iD.
-	fn generate_blocks_at<F>(
+	async fn generate_blocks_at<F>(
 		&mut self,
 		at: BlockId<Block>,
 		count: usize,
@@ -295,36 +295,36 @@ impl<D> Peer<D> {
 				Default::default()
 			};
 			self.block_import.import_block(import_block, cache).expect("block_import failed");
-			self.network.service().announce_block(hash, Vec::new());
+			self.network.service_mut().announce_block(hash, Vec::new()).await.unwrap();
 			at = hash;
 		}
 
 		self.network.update_chain();
-		self.network.service().announce_block(at.clone(), Vec::new());
+		self.network.service_mut().announce_block(at.clone(), Vec::new()).await.unwrap();
 		at
 	}
 
 	/// Push blocks to the peer (simplified: with or without a TX)
-	pub fn push_blocks(&mut self, count: usize, with_tx: bool) -> H256 {
+	pub async fn push_blocks(&mut self, count: usize, with_tx: bool) -> H256 {
 		let best_hash = self.client.info().best_hash;
-		self.push_blocks_at(BlockId::Hash(best_hash), count, with_tx)
+		self.push_blocks_at(BlockId::Hash(best_hash), count, with_tx).await
 	}
 
 	/// Push blocks to the peer (simplified: with or without a TX)
-	pub fn push_headers(&mut self, count: usize) -> H256 {
+	pub async fn push_headers(&mut self, count: usize) -> H256 {
 		let best_hash = self.client.info().best_hash;
-		self.generate_tx_blocks_at(BlockId::Hash(best_hash), count, false, true)
+		self.generate_tx_blocks_at(BlockId::Hash(best_hash), count, false, true).await
 	}
 
 	/// Push blocks to the peer (simplified: with or without a TX) starting from
 	/// given hash.
-	pub fn push_blocks_at(&mut self, at: BlockId<Block>, count: usize, with_tx: bool) -> H256 {
-		self.generate_tx_blocks_at(at, count, with_tx, false)
+	pub async fn push_blocks_at(&mut self, at: BlockId<Block>, count: usize, with_tx: bool) -> H256 {
+		self.generate_tx_blocks_at(at, count, with_tx, false).await
 	}
 
 	/// Push blocks/headers to the peer (simplified: with or without a TX) starting from
 	/// given hash.
-	fn generate_tx_blocks_at(&mut self, at: BlockId<Block>, count: usize, with_tx: bool, headers_only:bool) -> H256 {
+	async fn generate_tx_blocks_at(&mut self, at: BlockId<Block>, count: usize, with_tx: bool, headers_only:bool) -> H256 {
 		let mut nonce = 0;
 		if with_tx {
 			self.generate_blocks_at(
@@ -342,7 +342,7 @@ impl<D> Peer<D> {
 					builder.build().unwrap().block
 				},
 				headers_only
-			)
+			).await
 		} else {
 			self.generate_blocks_at(
 				at,
@@ -350,15 +350,15 @@ impl<D> Peer<D> {
 				BlockOrigin::File,
 				|builder| builder.build().unwrap().block,
 				headers_only,
-			)
+			).await
 		}
 	}
 
-	pub fn push_authorities_change_block(&mut self, new_authorities: Vec<AuthorityId>) -> H256 {
+	pub async fn push_authorities_change_block(&mut self, new_authorities: Vec<AuthorityId>) -> H256 {
 		self.generate_blocks(1, BlockOrigin::File, |mut builder| {
 			builder.push(Extrinsic::AuthoritiesChange(new_authorities.clone())).unwrap();
 			builder.build().unwrap().block
-		})
+		}).await
 	}
 
 	/// Get a reference to the client.
@@ -367,7 +367,7 @@ impl<D> Peer<D> {
 	}
 
 	/// Get a reference to the network service.
-	pub fn network_service(&self) -> &Arc<NetworkService<Block, <Block as BlockT>::Hash>> {
+	pub fn network_service(&self) -> &NetworkService<Block, <Block as BlockT>::Hash> {
 		&self.network.service()
 	}
 
@@ -801,7 +801,7 @@ pub trait TestNetFactory: Sized {
 		futures::executor::block_on(futures::future::poll_fn::<(), _>(|cx| self.poll_until_idle(cx)));
 	}
 
-	/// Polls the testnet. Processes all the pending actions and returns `NotReady`.
+	/// Polls the testnet.
 	fn poll(&mut self, cx: &mut FutureContext) {
 		self.mut_peers(|peers| {
 			for peer in peers {
@@ -813,7 +813,13 @@ pub trait TestNetFactory: Sized {
 
 				// We poll `imported_blocks_stream`.
 				while let Poll::Ready(Some(notification)) = peer.imported_blocks_stream.as_mut().poll_next(cx) {
-					peer.network.service().announce_block(notification.hash, Vec::new());
+					let hash = notification.hash;
+					futures::executor::block_on(async {
+						peer.network.service_mut()
+							.announce_block(hash, Vec::new())
+							.await
+							.unwrap()
+					})
 				}
 
 				// We poll `finality_notification_stream`, but we only take the last event.

@@ -111,3 +111,10 @@ impl <B: BlockT> Stream for NeighborPacketWorker<B> {
 		Poll::Pending
 	}
 }
+
+impl<B: BlockT> futures::stream::FusedStream for NeighborPacketWorker<B> {
+	fn is_terminated(&self) -> bool {
+		self.rx.is_terminated()
+	}
+}
+

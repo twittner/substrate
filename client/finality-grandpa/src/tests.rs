@@ -25,6 +25,7 @@ use sc_network_test::{
 };
 use sc_network::config::{ProtocolConfig, BoxFinalityProofRequestBuilder};
 use parking_lot::Mutex;
+use futures::executor::block_on;
 use futures_timer::Delay;
 use tokio::runtime::{Runtime, Handle};
 use sp_keyring::Ed25519Keyring;
@@ -419,7 +420,7 @@ fn finalize_3_voters_no_observers() {
 	let voters = make_ids(peers);
 
 	let mut net = GrandpaTestNet::new(TestApi::new(voters), 3);
-	net.peer(0).push_blocks(20, false);
+	block_on(async { net.peer(0).push_blocks(20, false).await });
 	net.block_until_sync();
 
 	for i in 0..3 {
@@ -445,7 +446,7 @@ fn finalize_3_voters_1_full_observer() {
 	let voters = make_ids(peers);
 
 	let mut net = GrandpaTestNet::new(TestApi::new(voters), 4);
-	net.peer(0).push_blocks(20, false);
+	block_on(async { net.peer(0).push_blocks(20, false).await });
 	net.block_until_sync();
 
 	let net = Arc::new(Mutex::new(net));
@@ -546,7 +547,7 @@ fn transition_3_voters_twice_1_full_observer() {
 
 	let mut runtime = Runtime::new().unwrap();
 
-	net.lock().peer(0).push_blocks(1, false);
+	block_on(async { net.lock().peer(0).push_blocks(1, false).await });
 	net.lock().block_until_sync();
 
 	for (i, peer) in net.lock().peers().iter().enumerate() {
@@ -572,34 +573,38 @@ fn transition_3_voters_twice_1_full_observer() {
 				match n.header.number() {
 					1 => {
 						// first 14 blocks.
-						net.lock().peer(0).push_blocks(13, false);
+						block_on(net.lock().peer(0).push_blocks(13, false));
 					},
 					14 => {
 						// generate transition at block 15, applied at 20.
-						net.lock().peer(0).generate_blocks(1, BlockOrigin::File, |builder| {
-							let mut block = builder.build().unwrap().block;
-							add_scheduled_change(&mut block, ScheduledChange {
-								next_authorities: make_ids(peers_b),
-								delay: 4,
-							});
+						block_on(async {
+							net.lock().peer(0).generate_blocks(1, BlockOrigin::File, |builder| {
+								let mut block = builder.build().unwrap().block;
+								add_scheduled_change(&mut block, ScheduledChange {
+									next_authorities: make_ids(peers_b),
+									delay: 4,
+								});
 
-							block
+								block
+							}).await;
+							net.lock().peer(0).push_blocks(5, false).await
 						});
-						net.lock().peer(0).push_blocks(5, false);
 					},
 					20 => {
 						// at block 21 we do another transition, but this time instant.
 						// add more until we have 30.
-						net.lock().peer(0).generate_blocks(1, BlockOrigin::File, |builder| {
-							let mut block = builder.build().unwrap().block;
-							add_scheduled_change(&mut block, ScheduledChange {
-								next_authorities: make_ids(&peers_c),
-								delay: 0,
-							});
+						block_on(async {
+							net.lock().peer(0).generate_blocks(1, BlockOrigin::File, |builder| {
+								let mut block = builder.build().unwrap().block;
+								add_scheduled_change(&mut block, ScheduledChange {
+									next_authorities: make_ids(&peers_c),
+									delay: 0,
+								});
 
-							block
+								block
+							}).await;
+							net.lock().peer(0).push_blocks(9, false).await
 						});
-						net.lock().peer(0).push_blocks(9, false);
 					},
 					_ => {},
 				}
@@ -684,7 +689,7 @@ fn justification_is_emitted_when_consensus_data_changes() {
 
 	// import block#1 WITH consensus data change
 	let new_authorities = vec![sp_consensus_babe::AuthorityId::from_slice(&[42; 32])];
-	net.peer(0).push_authorities_change_block(new_authorities);
+	block_on(net.peer(0).push_authorities_change_block(new_authorities));
 	net.block_until_sync();
 	let net = Arc::new(Mutex::new(net));
 	run_to_completion(&mut runtime, 1, net.clone(), peers);
@@ -701,7 +706,7 @@ fn justification_is_generated_periodically() {
 	let voters = make_ids(peers);
 
 	let mut net = GrandpaTestNet::new(TestApi::new(voters), 3);
-	net.peer(0).push_blocks(32, false);
+	block_on(net.peer(0).push_blocks(32, false));
 	net.block_until_sync();
 
 	let net = Arc::new(Mutex::new(net));
@@ -745,20 +750,20 @@ fn sync_justifications_on_change_blocks() {
 	let mut net = GrandpaTestNet::new(api, 4);
 
 	// add 20 blocks
-	net.peer(0).push_blocks(20, false);
+	block_on(net.peer(0).push_blocks(20, false));
 
 	// at block 21 we do add a transition which is instant
-	net.peer(0).generate_blocks(1, BlockOrigin::File, |builder| {
+	block_on(net.peer(0).generate_blocks(1, BlockOrigin::File, |builder| {
 		let mut block = builder.build().unwrap().block;
 		add_scheduled_change(&mut block, ScheduledChange {
 			next_authorities: make_ids(peers_b),
 			delay: 0,
 		});
 		block
-	});
+	}));
 
 	// add more blocks on top of it (until we have 25)
-	net.peer(0).push_blocks(4, false);
+	block_on(net.peer(0).push_blocks(4, false));
 	net.block_until_sync();
 
 	for i in 0..4 {
@@ -806,33 +811,33 @@ fn finalizes_multiple_pending_changes_in_order() {
 	let mut net = GrandpaTestNet::new(api, 6);
 
 	// add 20 blocks
-	net.peer(0).push_blocks(20, false);
+	block_on(net.peer(0).push_blocks(20, false));
 
 	// at block 21 we do add a transition which is instant
-	net.peer(0).generate_blocks(1, BlockOrigin::File, |builder| {
+	block_on(net.peer(0).generate_blocks(1, BlockOrigin::File, |builder| {
 		let mut block = builder.build().unwrap().block;
 		add_scheduled_change(&mut block, ScheduledChange {
 			next_authorities: make_ids(peers_b),
 			delay: 0,
 		});
 		block
-	});
+	}));
 
 	// add more blocks on top of it (until we have 25)
-	net.peer(0).push_blocks(4, false);
+	block_on(net.peer(0).push_blocks(4, false));
 
 	// at block 26 we add another which is enacted at block 30
-	net.peer(0).generate_blocks(1, BlockOrigin::File, |builder| {
+	block_on(net.peer(0).generate_blocks(1, BlockOrigin::File, |builder| {
 		let mut block = builder.build().unwrap().block;
 		add_scheduled_change(&mut block, ScheduledChange {
 			next_authorities: make_ids(peers_c),
 			delay: 4,
 		});
 		block
-	});
+	}));
 
 	// add more blocks on top of it (until we have 30)
-	net.peer(0).push_blocks(4, false);
+	block_on(net.peer(0).push_blocks(4, false));
 
 	net.block_until_sync();
 
@@ -865,7 +870,7 @@ fn force_change_to_new_set() {
 	let net = GrandpaTestNet::new(api, 3);
 	let net = Arc::new(Mutex::new(net));
 
-	net.lock().peer(0).generate_blocks(1, BlockOrigin::File, |builder| {
+	block_on(net.lock().peer(0).generate_blocks(1, BlockOrigin::File, |builder| {
 		let mut block = builder.build().unwrap().block;
 
 		// add a forced transition at block 12.
@@ -881,9 +886,9 @@ fn force_change_to_new_set() {
 		});
 
 		block
-	});
+	}));
 
-	net.lock().peer(0).push_blocks(25, false);
+	block_on(net.lock().peer(0).push_blocks(25, false));
 	net.lock().block_until_sync();
 
 	for (i, peer) in net.lock().peers().iter().enumerate() {
@@ -1020,7 +1025,7 @@ fn voter_persists_its_votes() {
 
 	// alice has a chain with 20 blocks
 	let mut net = GrandpaTestNet::new(TestApi::new(voters.clone()), 2);
-	net.peer(0).push_blocks(20, false);
+	block_on(net.peer(0).push_blocks(20, false));
 	net.block_until_sync();
 
 	assert_eq!(net.peer(0).client().info().best_number, 20,
@@ -1168,7 +1173,7 @@ fn voter_persists_its_votes() {
 
 		runtime.spawn(network);
 
-		let round_tx = Arc::new(Mutex::new(round_tx));
+		let round_tx = Arc::new(Mutex::new(Box::pin(round_tx.into_sink())));
 		let exit_tx = Arc::new(Mutex::new(Some(exit_tx)));
 
 		let net = net.clone();
@@ -1195,7 +1200,7 @@ fn voter_persists_its_votes() {
 					assert!(prevote.target_number == 15);
 
 					// we push 20 more blocks to alice's chain
-					net.lock().peer(0).push_blocks(20, false);
+					block_on(net.lock().peer(0).push_blocks(20, false));
 
 					let interval = futures::stream::unfold(Delay::new(Duration::from_millis(200)), |delay|
 						Box::pin(async move {
@@ -1272,7 +1277,7 @@ fn finalize_3_voters_1_light_observer() {
 	let voters = make_ids(authorities);
 
 	let mut net = GrandpaTestNet::new(TestApi::new(voters), 4);
-	net.peer(0).push_blocks(20, false);
+	block_on(net.peer(0).push_blocks(20, false));
 	net.block_until_sync();
 
 	for i in 0..4 {
@@ -1320,7 +1325,7 @@ fn finality_proof_is_fetched_by_light_client_when_consensus_data_changes() {
 
 	// import block#1 WITH consensus data change. Light client ignores justification
 	// && instead fetches finality proof for block #1
-	net.peer(0).push_authorities_change_block(vec![sp_consensus_babe::AuthorityId::from_slice(&[42; 32])]);
+	block_on(net.peer(0).push_authorities_change_block(vec![sp_consensus_babe::AuthorityId::from_slice(&[42; 32])]));
 	let net = Arc::new(Mutex::new(net));
 	run_to_completion(&mut runtime, 1, net.clone(), peers);
 	net.lock().block_until_sync();
@@ -1368,7 +1373,7 @@ fn empty_finality_proof_is_returned_to_light_client_when_authority_set_is_differ
 	let net = Arc::new(Mutex::new(net));
 
 	// best is #1
-	net.lock().peer(0).generate_blocks(1, BlockOrigin::File, |builder| {
+	block_on(net.lock().peer(0).generate_blocks(1, BlockOrigin::File, |builder| {
 		// add a forced transition at block 5.
 		let mut block = builder.build().unwrap().block;
 		if FORCE_CHANGE {
@@ -1378,15 +1383,15 @@ fn empty_finality_proof_is_returned_to_light_client_when_authority_set_is_differ
 			});
 		}
 		block
-	});
+	}));
 
 	// ensure block#10 enacts authorities set change => justification is generated
 	// normally it will reach light client, but because of the forced change, it will not
-	net.lock().peer(0).push_blocks(8, false); // best is #9
-	net.lock().peer(0).push_authorities_change_block(
+	block_on(net.lock().peer(0).push_blocks(8, false)); // best is #9
+	block_on(net.lock().peer(0).push_authorities_change_block(
 		vec![sp_consensus_babe::AuthorityId::from_slice(&[42; 32])]
-	); // #10
-	net.lock().peer(0).push_blocks(1, false); // best is #11
+	)); // #10
+	block_on(net.lock().peer(0).push_blocks(1, false)); // best is #11
 	net.lock().block_until_sync();
 
 	// finalize block #11 on full clients
@@ -1412,7 +1417,7 @@ fn voter_catches_up_to_latest_round_when_behind() {
 	let voters = make_ids(peers);
 
 	let mut net = GrandpaTestNet::new(TestApi::new(voters), 3);
-	net.peer(0).push_blocks(50, false);
+	block_on(net.peer(0).push_blocks(50, false));
 	net.block_until_sync();
 
 	let net = Arc::new(Mutex::new(net));
@@ -1573,7 +1578,7 @@ fn grandpa_environment_respects_voting_rules() {
 	};
 
 	// add 21 blocks
-	peer.push_blocks(21, false);
+	block_on(peer.push_blocks(21, false));
 
 	// create an environment with no voting rule restrictions
 	let unrestricted_env = environment(Box::new(()));

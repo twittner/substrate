@@ -244,6 +244,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-trait"
+version = "0.1.30"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da71fef07bc806586090247e971229289f64c210a278ee5ae419314eb386b31d"
+dependencies = [
+ "proc-macro2",
+ "quote 1.0.3",
+ "syn 1.0.17",
+]
+
+[[package]]
 name = "atty"
 version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5849,6 +5860,8 @@ dependencies = [
 name = "sc-authority-discovery"
 version = "0.8.0-dev"
 dependencies = [
+ "async-std",
+ "async-trait",
  "bytes 0.5.4",
  "derive_more",
  "env_logger 0.7.1",
@@ -6368,6 +6381,8 @@ name = "sc-finality-grandpa"
 version = "0.8.0-dev"
 dependencies = [
  "assert_matches",
+ "async-std",
+ "async-trait",
  "derive_more",
  "env_logger 0.7.1",
  "finality-grandpa",
@@ -6378,6 +6393,7 @@ dependencies = [
  "parity-scale-codec",
  "parking_lot 0.10.2",
  "pin-project",
+ "quicksink",
  "rand 0.7.3",
  "sc-block-builder",
  "sc-client-api",
@@ -6520,6 +6536,7 @@ name = "sc-network-gossip"
 version = "0.8.0-dev"
 dependencies = [
  "async-std",
+ "async-trait",
  "futures 0.3.4",
  "futures-timer 3.0.2",
  "libp2p",
@@ -6530,6 +6547,7 @@ dependencies = [
  "sc-network",
  "sp-runtime",
  "substrate-test-runtime-client",
+ "thiserror",
  "wasm-timer",
 ]
 

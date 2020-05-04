@@ -387,8 +387,6 @@ mod tests {
 	use sc_network::PeerId;
 	use sp_blockchain::HeaderBackend as _;
 
-	use futures::executor;
-
 	/// Ensure `Future` implementation of `ObserverWork` is polling its `NetworkBridge`. Regression
 	/// test for bug introduced in d4fbb897c and fixed in b7af8b339.
 	///
@@ -401,7 +399,7 @@ mod tests {
 	fn observer_work_polls_underlying_network_bridge() {
 		// Create a test network.
 		let (tester_fut, _network) = make_test_network();
-		let mut tester = executor::block_on(tester_fut);
+		let mut tester = async_std::task::block_on(tester_fut);
 
 		// Create an observer.
 		let (client, backend) = {
@@ -421,7 +419,7 @@ mod tests {
 		).unwrap();
 
 		let (_tx, voter_command_rx) = tracing_unbounded("");
-		let observer = ObserverWork::new(
+		let mut observer = ObserverWork::new(
 			client,
 			tester.net_handle.clone(),
 			persistent_data,
@@ -433,10 +431,10 @@ mod tests {
 		let peer_id = PeerId::random();
 		tester.trigger_gossip_validator_reputation_change(&peer_id);
 
-		executor::block_on(async move {
+		async_std::task::block_on(async move {
 			// Poll the observer once and have it forward the reputation change from the gossip
 			// validator to the test network.
-			assert!(observer.now_or_never().is_none());
+			assert!((&mut observer).now_or_never().is_none());
 
 			// Ignore initial event stream request by gossip engine.
 			match tester.events.next().now_or_never() {

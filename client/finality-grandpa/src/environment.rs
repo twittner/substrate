@@ -686,13 +686,8 @@ where
 	type Signature = AuthoritySignature;
 
 	// regular round message streams
-	type In = Pin<Box<dyn Stream<
-		Item = Result<::finality_grandpa::SignedMessage<Block::Hash, NumberFor<Block>, Self::Signature, Self::Id>, Self::Error>
-	> + Send + Sync>>;
-	type Out = Pin<Box<dyn Sink<
-		::finality_grandpa::Message<Block::Hash, NumberFor<Block>>,
-		Error = Self::Error,
-	> + Send + Sync>>;
+	type In = Pin<Box<dyn Stream<Item = Result<::finality_grandpa::SignedMessage<Block::Hash, NumberFor<Block>, Self::Signature, Self::Id>, Self::Error>> + Send + Sync>>;
+	type Out = Pin<Box<dyn Sink<::finality_grandpa::Message<Block::Hash, NumberFor<Block>>, Error = Self::Error> + Send + Sync>>;
 
 	type Error = CommandOrError<Block::Hash, NumberFor<Block>>;
 
@@ -736,7 +731,7 @@ where
 		).map_err(Into::into));
 
 		// schedule network message cleanup when sink drops.
-		let outgoing = Box::pin(outgoing.sink_err_into());
+		let outgoing = Box::pin(outgoing.into_sink().sink_map_err(Error::Network).sink_err_into());
 
 		voter::RoundData {
 			voter_id: local_key.map(|pair| pair.public()),

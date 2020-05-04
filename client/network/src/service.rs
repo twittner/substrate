@@ -31,7 +31,7 @@ use crate::{
 	behaviour::{Behaviour, BehaviourOut},
 	config::{parse_addr, parse_str_addr, NonReservedPeerMode, Params, Role, TransportConfig},
 	discovery::DiscoveryConfig,
-	error::Error,
+	error::{Error, ServiceError},
 	network_state::{
 		NetworkState, NotConnectedPeer as NetworkStateNotConnectedPeer, Peer as NetworkStatePeer,
 	},
@@ -40,7 +40,7 @@ use crate::{
 	protocol::{self, event::Event, LegacyConnectionKillError, sync::SyncState, PeerInfo, Protocol},
 	transport, ReputationChange,
 };
-use futures::prelude::*;
+use futures::{prelude::*, channel::mpsc};
 use libp2p::{PeerId, Multiaddr};
 use libp2p::core::{ConnectedPoint, Executor, connection::{ConnectionError, PendingConnectionError}, either::EitherError};
 use libp2p::kad::record;
@@ -57,7 +57,7 @@ use sp_runtime::{
 	traits::{Block as BlockT, NumberFor},
 	ConsensusEngineId,
 };
-use sp_utils::mpsc::{tracing_unbounded, TracingUnboundedReceiver, TracingUnboundedSender};
+use sp_utils::mpsc::TracingUnboundedReceiver;
 use std::{
 	borrow::{Borrow, Cow},
 	collections::HashSet,
@@ -78,6 +78,7 @@ mod out_events;
 mod tests;
 
 /// Substrate network service. Handles network IO and manages connectivity.
+#[derive(Clone)]
 pub struct NetworkService<B: BlockT + 'static, H: ExHashT> {
 	/// Number of peers we're connected to.
 	num_connected: Arc<AtomicUsize>,
@@ -93,10 +94,39 @@ pub struct NetworkService<B: BlockT + 'static, H: ExHashT> {
 	/// nodes it should be connected to or not.
 	peerset: PeersetHandle,
 	/// Channel that sends messages to the actual worker.
-	to_worker: TracingUnboundedSender<ServiceToWorkerMsg<B, H>>,
+	to_worker: mpsc::Sender<ServiceToWorkerMsg<B, H>>,
 	/// Marker to pin the `H` generic. Serves no purpose except to not break backwards
 	/// compatibility.
 	_marker: PhantomData<H>,
+}
+
+/// Main network worker. Must be polled in order for the network to advance.
+///
+/// You are encouraged to poll this in a separate background thread or task.
+#[must_use = "The NetworkWorker must be polled in order for the network to work"]
+pub struct NetworkWorker<B: BlockT + 'static, H: ExHashT> {
+	/// Updated by the `NetworkWorker` and loaded by the `NetworkService`.
+	external_addresses: Arc<Mutex<Vec<Multiaddr>>>,
+	/// Updated by the `NetworkWorker` and loaded by the `NetworkService`.
+	num_connected: Arc<AtomicUsize>,
+	/// Updated by the `NetworkWorker` and loaded by the `NetworkService`.
+	is_major_syncing: Arc<AtomicBool>,
+	/// The network service that can be extracted and shared through the codebase.
+	service: NetworkService<B, H>,
+	/// The *actual* network.
+	network_service: Swarm<B, H>,
+	/// The import queue that was passed as initialization.
+	import_queue: Box<dyn ImportQueue<B>>,
+	/// Messages from the `NetworkService` and that must be processed.
+	from_worker: mpsc::Receiver<ServiceToWorkerMsg<B, H>>,
+	/// Receiver for queries from the light client that must be processed.
+	light_client_rqs: Option<TracingUnboundedReceiver<light_client_handler::Request<B>>>,
+	/// Senders for events that happen on the network.
+	event_streams: out_events::OutChannels,
+	/// Prometheus network metrics.
+	metrics: Option<Metrics>,
+	/// The `PeerId`'s of all boot nodes.
+	boot_node_ids: Arc<HashSet<PeerId>>,
 }
 
 impl<B: BlockT + 'static, H: ExHashT> NetworkWorker<B, H> {
@@ -106,7 +136,7 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkWorker<B, H> {
 	/// for the network processing to advance. From it, you can extract a `NetworkService` using
 	/// `worker.service()`. The `NetworkService` can be shared through the codebase.
 	pub fn new(params: Params<B, H>) -> Result<NetworkWorker<B, H>, Error> {
-		let (to_worker, from_worker) = tracing_unbounded("mpsc_network_worker");
+		let (to_worker, from_worker) = mpsc::channel(1);
 
 		if let Some(path) = params.network_config.net_config_path {
 			fs::create_dir_all(&path)?;
@@ -323,7 +353,7 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkWorker<B, H> {
 
 		let external_addresses = Arc::new(Mutex::new(Vec::new()));
 
-		let service = Arc::new(NetworkService {
+		let service = NetworkService {
 			bandwidth,
 			external_addresses: external_addresses.clone(),
 			num_connected: num_connected.clone(),
@@ -332,7 +362,7 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkWorker<B, H> {
 			local_peer_id,
 			to_worker,
 			_marker: PhantomData,
-		});
+		};
 
 		Ok(NetworkWorker {
 			external_addresses,
@@ -404,10 +434,14 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkWorker<B, H> {
 		self.network_service.add_known_address(peer_id, addr);
 	}
 
-	/// Return a `NetworkService` that can be shared through the code base and can be used to
-	/// manipulate the worker.
-	pub fn service(&self) -> &Arc<NetworkService<B, H>> {
+	/// Return a shared reference to the network service.
+	pub fn service(&self) -> &NetworkService<B, H> {
 		&self.service
+	}
+
+	/// Return a unique reference to the network service.
+	pub fn service_mut(&mut self) -> &mut NetworkService<B, H> {
+		&mut self.service
 	}
 
 	/// You must call this when a new block is finalized by the client.
@@ -502,17 +536,6 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkWorker<B, H> {
 			.map(|(id, info)| (id.clone(), info.clone()))
 			.collect()
 	}
-
-	/// Removes a `PeerId` from the list of reserved peers.
-	pub fn remove_reserved_peer(&self, peer: PeerId) {
-		self.service.remove_reserved_peer(peer);
-	}
-
-	/// Adds a `PeerId` and its address as reserved. The string should encode the address
-	/// and peer ID of the remote node.
-	pub fn add_reserved_peer(&self, peer: String) -> Result<(), String> {
-		self.service.add_reserved_peer(peer)
-	}
 }
 
 impl<B: BlockT + 'static, H: ExHashT> NetworkService<B, H> {
@@ -532,12 +555,19 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkService<B, H> {
 	///
 	/// The protocol must have been registered with `register_notifications_protocol`.
 	///
-	pub fn write_notification(&self, target: PeerId, engine_id: ConsensusEngineId, message: Vec<u8>) {
-		let _ = self.to_worker.unbounded_send(ServiceToWorkerMsg::WriteNotification {
+	pub async fn write_notification (
+		&mut self,
+		target: PeerId,
+		engine_id: ConsensusEngineId,
+		message: Vec<u8>
+	) -> Result<(), ServiceError> {
+		let msg = ServiceToWorkerMsg::WriteNotification {
 			target,
 			engine_id,
 			message,
-		});
+		};
+		self.to_worker.send(msg).await?;
+		Ok(())
 	}
 
 	/// Returns a stream containing the events that happen on the network.
@@ -549,11 +579,15 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkService<B, H> {
 	/// The name passed is used to identify the channel in the Prometheus metrics. Note that the
 	/// parameter is a `&'static str`, and not a `String`, in order to avoid accidentally having
 	/// an unbounded set of Prometheus metrics, which would be quite bad in terms of memory
-	pub fn event_stream(&self, name: &'static str) -> impl Stream<Item = Event> {
+	pub async fn event_stream (
+		&mut self,
+		name: &'static str
+	) -> Result<impl Stream<Item = Event>, ServiceError> {
 		// Note: when transitioning to stable futures, remove the `Error` entirely
 		let (tx, rx) = out_events::channel(name);
-		let _ = self.to_worker.unbounded_send(ServiceToWorkerMsg::EventStream(tx));
-		rx
+		let msg = ServiceToWorkerMsg::EventStream(tx);
+		self.to_worker.send(msg).await?;
+		Ok(rx)
 	}
 
 	/// Registers a new notifications protocol.
@@ -565,39 +599,47 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkService<B, H> {
 	///
 	/// You are very strongly encouraged to call this method very early on. Any connection open
 	/// will retain the protocols that were registered then, and not any new one.
-	pub fn register_notifications_protocol(
-		&self,
+	pub async fn register_notifications_protocol(
+		&mut self,
 		engine_id: ConsensusEngineId,
 		protocol_name: impl Into<Cow<'static, [u8]>>,
-	) {
-		let _ = self.to_worker.unbounded_send(ServiceToWorkerMsg::RegisterNotifProtocol {
+	) -> Result<(), ServiceError> {
+		let msg = ServiceToWorkerMsg::RegisterNotifProtocol {
 			engine_id,
 			protocol_name: protocol_name.into(),
-		});
+		};
+		self.to_worker.send(msg).await?;
+		Ok(())
 	}
 
 	/// You may call this when new transactons are imported by the transaction pool.
 	///
 	/// All transactions will be fetched from the `TransactionPool` that was passed at
 	/// initialization as part of the configuration and propagated to peers.
-	pub fn trigger_repropagate(&self) {
-		let _ = self.to_worker.unbounded_send(ServiceToWorkerMsg::PropagateExtrinsics);
+	pub async fn trigger_repropagate(&mut self) -> Result<(), ServiceError> {
+		let msg = ServiceToWorkerMsg::PropagateExtrinsics;
+		self.to_worker.send(msg).await?;
+		Ok(())
 	}
 
 	/// You must call when new transaction is imported by the transaction pool.
 	///
 	/// This transaction will be fetched from the `TransactionPool` that was passed at
 	/// initialization as part of the configuration and propagated to peers.
-	pub fn propagate_extrinsic(&self, hash: H) {
-		let _ = self.to_worker.unbounded_send(ServiceToWorkerMsg::PropagateExtrinsic(hash));
+	pub async fn propagate_extrinsic(&mut self, hash: H) -> Result<(), ServiceError> {
+		let msg = ServiceToWorkerMsg::PropagateExtrinsic(hash);
+		self.to_worker.send(msg).await?;
+		Ok(())
 	}
 
 	/// Make sure an important block is propagated to peers.
 	///
 	/// In chain-based consensus, we often need to make sure non-best forks are
 	/// at least temporarily synced. This function forces such an announcement.
-	pub fn announce_block(&self, hash: B::Hash, data: Vec<u8>) {
-		let _ = self.to_worker.unbounded_send(ServiceToWorkerMsg::AnnounceBlock(hash, data));
+	pub async fn announce_block(&mut self, hash: B::Hash, data: Vec<u8>) -> Result<(), ServiceError> {
+		let msg = ServiceToWorkerMsg::AnnounceBlock(hash, data);
+		self.to_worker.send(msg).await?;
+		Ok(())
 	}
 
 	/// Report a given peer as either beneficial (+) or costly (-) according to the
@@ -609,18 +651,24 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkService<B, H> {
 	/// Disconnect from a node as soon as possible.
 	///
 	/// This triggers the same effects as if the connection had closed itself spontaneously.
-	pub fn disconnect_peer(&self, who: PeerId) {
-		let _ = self.to_worker.unbounded_send(ServiceToWorkerMsg::DisconnectPeer(who));
+	pub async fn disconnect_peer(&mut self, who: PeerId) -> Result<(), ServiceError> {
+		let msg = ServiceToWorkerMsg::DisconnectPeer(who);
+		self.to_worker.send(msg).await?;
+		Ok(())
 	}
 
 	/// Request a justification for the given block from the network.
 	///
 	/// On success, the justification will be passed to the import queue that was part at
 	/// initialization as part of the configuration.
-	pub fn request_justification(&self, hash: &B::Hash, number: NumberFor<B>) {
-		let _ = self
-			.to_worker
-			.unbounded_send(ServiceToWorkerMsg::RequestJustification(*hash, number));
+	pub async fn request_justification (
+		&mut self,
+		hash: &B::Hash,
+		number: NumberFor<B>
+	) -> Result<(), ServiceError> {
+		let msg = ServiceToWorkerMsg::RequestJustification(*hash, number);
+		self.to_worker.send(msg).await?;
+		Ok(())
 	}
 
 	/// Are we in the process of downloading the chain?
@@ -632,20 +680,20 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkService<B, H> {
 	///
 	/// This will generate either a `ValueFound` or a `ValueNotFound` event and pass it as an
 	/// item on the [`NetworkWorker`] stream.
-	pub fn get_value(&self, key: &record::Key) {
-		let _ = self
-			.to_worker
-			.unbounded_send(ServiceToWorkerMsg::GetValue(key.clone()));
+	pub async fn get_value(&mut self, key: &record::Key) -> Result<(), ServiceError> {
+		let msg = ServiceToWorkerMsg::GetValue(key.clone());
+		self.to_worker.send(msg).await?;
+		Ok(())
 	}
 
 	/// Start putting a value in the DHT.
 	///
 	/// This will generate either a `ValuePut` or a `ValuePutFailed` event and pass it as an
 	/// item on the [`NetworkWorker`] stream.
-	pub fn put_value(&self, key: record::Key, value: Vec<u8>) {
-		let _ = self
-			.to_worker
-			.unbounded_send(ServiceToWorkerMsg::PutValue(key, value));
+	pub async fn put_value(&mut self, key: record::Key, value: Vec<u8>) -> Result<(), ServiceError> {
+		let msg = ServiceToWorkerMsg::PutValue(key, value);
+		self.to_worker.send(msg).await?;
+		Ok(())
 	}
 
 	/// Connect to unreserved peers and allow unreserved peers to connect.
@@ -665,12 +713,11 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkService<B, H> {
 
 	/// Adds a `PeerId` and its address as reserved. The string should encode the address
 	/// and peer ID of the remote node.
-	pub fn add_reserved_peer(&self, peer: String) -> Result<(), String> {
-		let (peer_id, addr) = parse_str_addr(&peer).map_err(|e| format!("{:?}", e))?;
+	pub async fn add_reserved_peer(&mut self, peer: String) -> Result<(), ServiceError> {
+		let (peer_id, addr) = parse_str_addr(&peer)?;
 		self.peerset.add_reserved_peer(peer_id.clone());
-		let _ = self
-			.to_worker
-			.unbounded_send(ServiceToWorkerMsg::AddKnownAddress(peer_id, addr));
+		let msg = ServiceToWorkerMsg::AddKnownAddress(peer_id, addr);
+		self.to_worker.send(msg).await?;
 		Ok(())
 	}
 
@@ -680,25 +727,33 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkService<B, H> {
 	/// `set_sync_fork_request` should only be used if external code detects that there's
 	/// a stale fork missing.
 	/// Passing empty `peers` set effectively removes the sync request.
-	pub fn set_sync_fork_request(&self, peers: Vec<PeerId>, hash: B::Hash, number: NumberFor<B>) {
-		let _ = self
-			.to_worker
-			.unbounded_send(ServiceToWorkerMsg::SyncFork(peers, hash, number));
+	pub async fn set_sync_fork_request (
+		&mut self,
+		peers: Vec<PeerId>,
+		hash: B::Hash,
+		number: NumberFor<B>
+	) -> Result<(), ServiceError> {
+		let msg = ServiceToWorkerMsg::SyncFork(peers, hash, number);
+		self.to_worker.send(msg).await?;
+		Ok(())
 	}
 
 	/// Modify a peerset priority group.
-	pub fn set_priority_group(&self, group_id: String, peers: HashSet<Multiaddr>) -> Result<(), String> {
-		let peers = peers.into_iter().map(|p| {
-			parse_addr(p).map_err(|e| format!("{:?}", e))
-		}).collect::<Result<Vec<(PeerId, Multiaddr)>, String>>()?;
+	pub async fn set_priority_group (
+		&mut self,
+		group_id: String,
+		peers: HashSet<Multiaddr>
+	) -> Result<(), ServiceError> {
+		let peers = peers.into_iter()
+			.map(|p| parse_addr(p).map_err(|e| e.into()))
+			.collect::<Result<Vec<(PeerId, Multiaddr)>, ServiceError>>()?;
 
 		let peer_ids = peers.iter().map(|(peer_id, _addr)| peer_id.clone()).collect();
 		self.peerset.set_priority_group(group_id, peer_ids);
 
 		for (peer_id, addr) in peers.into_iter() {
-			let _ = self
-				.to_worker
-				.unbounded_send(ServiceToWorkerMsg::AddKnownAddress(peer_id, addr));
+			let msg = ServiceToWorkerMsg::AddKnownAddress(peer_id, addr);
+			self.to_worker.send(msg).await?
 		}
 
 		Ok(())
@@ -753,6 +808,7 @@ impl<B, H> NetworkStateInfo for NetworkService<B, H>
 /// Messages sent from the `NetworkService` to the `NetworkWorker`.
 ///
 /// Each entry corresponds to a method of `NetworkService`.
+#[derive(Debug)]
 enum ServiceToWorkerMsg<B: BlockT, H: ExHashT> {
 	PropagateExtrinsic(H),
 	PropagateExtrinsics,
@@ -775,35 +831,7 @@ enum ServiceToWorkerMsg<B: BlockT, H: ExHashT> {
 	DisconnectPeer(PeerId),
 }
 
-/// Main network worker. Must be polled in order for the network to advance.
-///
-/// You are encouraged to poll this in a separate background thread or task.
-#[must_use = "The NetworkWorker must be polled in order for the network to work"]
-pub struct NetworkWorker<B: BlockT + 'static, H: ExHashT> {
-	/// Updated by the `NetworkWorker` and loaded by the `NetworkService`.
-	external_addresses: Arc<Mutex<Vec<Multiaddr>>>,
-	/// Updated by the `NetworkWorker` and loaded by the `NetworkService`.
-	num_connected: Arc<AtomicUsize>,
-	/// Updated by the `NetworkWorker` and loaded by the `NetworkService`.
-	is_major_syncing: Arc<AtomicBool>,
-	/// The network service that can be extracted and shared through the codebase.
-	service: Arc<NetworkService<B, H>>,
-	/// The *actual* network.
-	network_service: Swarm<B, H>,
-	/// The import queue that was passed as initialization.
-	import_queue: Box<dyn ImportQueue<B>>,
-	/// Messages from the `NetworkService` and that must be processed.
-	from_worker: TracingUnboundedReceiver<ServiceToWorkerMsg<B, H>>,
-	/// Receiver for queries from the light client that must be processed.
-	light_client_rqs: Option<TracingUnboundedReceiver<light_client_handler::Request<B>>>,
-	/// Senders for events that happen on the network.
-	event_streams: out_events::OutChannels,
-	/// Prometheus network metrics.
-	metrics: Option<Metrics>,
-	/// The `PeerId`'s of all boot nodes.
-	boot_node_ids: Arc<HashSet<PeerId>>,
-}
-
+#[derive(Debug)]
 struct Metrics {
 	// This list is ordered alphabetically
 	connections_closed_total: CounterVec<U64>,
@@ -1329,6 +1357,12 @@ impl<B: BlockT + 'static, H: ExHashT> Future for NetworkWorker<B, H> {
 		}
 
 		Poll::Pending
+	}
+}
+
+impl<B: BlockT + 'static, H: ExHashT> futures::future::FusedFuture for NetworkWorker<B, H> {
+	fn is_terminated(&self) -> bool {
+		false
 	}
 }
 
