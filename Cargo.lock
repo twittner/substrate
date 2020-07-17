@@ -1290,6 +1290,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "event-listener"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "699d84875f1b72b4da017e6b0f77dfa88c0137f089958a88974d15938cbc2976"
+
+[[package]]
 name = "evm"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3256,6 +3262,26 @@ dependencies = [
  "keccak",
  "rand_core 0.5.1",
  "zeroize",
+]
+
+[[package]]
+name = "minicbor"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ba51ba9e365147a1bfb1442afbb5d887530eee5ed7dca410c2ba365ad617083"
+dependencies = [
+ "minicbor-derive",
+]
+
+[[package]]
+name = "minicbor-derive"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3436a67b46fbf4b5cc25a37341b3daf0371496dac1161422b96225dde8f603ee"
+dependencies = [
+ "proc-macro2",
+ "quote 1.0.6",
+ "syn 1.0.33",
 ]
 
 [[package]]
@@ -6671,6 +6697,7 @@ dependencies = [
  "either",
  "env_logger 0.7.1",
  "erased-serde",
+ "event-listener",
  "fnv",
  "fork-tree",
  "futures 0.3.5",
@@ -6682,7 +6709,8 @@ dependencies = [
  "linked-hash-map",
  "linked_hash_set",
  "log",
- "lru 0.4.3",
+ "lru 0.5.3",
+ "minicbor",
  "nohash-hasher",
  "parity-scale-codec",
  "parking_lot 0.10.2",

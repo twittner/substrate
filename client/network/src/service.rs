@@ -41,6 +41,7 @@ use crate::{
 	protocol::{self, event::Event, LegacyConnectionKillError, sync::SyncState, PeerInfo, Protocol},
 	transport, ReputationChange,
 };
+use event_listener::EventListener;
 use futures::{channel::oneshot, prelude::*};
 use libp2p::{PeerId, Multiaddr};
 use libp2p::core::{ConnectedPoint, Executor, connection::{ConnectionError, PendingConnectionError}, either::EitherError};
@@ -612,22 +613,31 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkService<B, H> {
 		&self,
 		target: PeerId,
 		protocol: impl Into<Cow<'static, str>>,
-		request: Vec<u8>
+		mut request: Vec<u8>
 	) -> Result<Vec<u8>, RequestFailure> {
-		let (tx, rx) = oneshot::channel();
-		let _ = self.to_worker.unbounded_send(ServiceToWorkerMsg::Request {
-			target,
-			protocol: protocol.into(),
-			request,
-			pending_response: tx
-		});
+		let protocol = protocol.into();
+		loop {
+			let (tx, rx) = oneshot::channel();
 
-		match rx.await {
-			Ok(v) => v,
-			// The channel can only be closed if the network worker no longer exists. If the
-			// network worker no longer exists, then all connections to `target` are necessarily
-			// closed, and we legitimately report this situation as a "ConnectionClosed".
-			Err(_) => Err(RequestFailure::Network(OutboundFailure::ConnectionClosed)),
+			let _ = self.to_worker.unbounded_send(ServiceToWorkerMsg::Request {
+				target: target.clone(),
+				protocol: protocol.clone(),
+				request: std::mem::take(&mut request),
+				pending_response: tx
+			});
+
+			match rx.await {
+				Ok(RequestResult::Response(v)) => return Ok(v),
+				Ok(RequestResult::Error(e)) => return Err(e),
+				Ok(RequestResult::BackOff(listener, req)) => {
+					request = req;
+					listener.await
+				}
+				// The channel can only be closed if the network worker no longer exists. If the
+				// network worker no longer exists, then all connections to `target` are necessarily
+				// closed, and we legitimately report this situation as a "ConnectionClosed".
+				Err(_) => return Err(RequestFailure::Network(OutboundFailure::ConnectionClosed))
+			}
 		}
 	}
 
@@ -889,7 +899,7 @@ enum ServiceToWorkerMsg<B: BlockT, H: ExHashT> {
 		target: PeerId,
 		protocol: Cow<'static, str>,
 		request: Vec<u8>,
-		pending_response: oneshot::Sender<Result<Vec<u8>, RequestFailure>>,
+		pending_response: oneshot::Sender<RequestResult>,
 	},
 	RegisterNotifProtocol {
 		engine_id: ConsensusEngineId,
@@ -898,6 +908,12 @@ enum ServiceToWorkerMsg<B: BlockT, H: ExHashT> {
 	DisconnectPeer(PeerId),
 	UpdateChain,
 	OwnBlockImported(B::Hash, NumberFor<B>),
+}
+
+enum RequestResult {
+	BackOff(EventListener, Vec<u8>),
+	Error(RequestFailure),
+	Response(Vec<u8>)
 }
 
 /// Main network worker. Must be polled in order for the network to advance.
@@ -930,10 +946,7 @@ pub struct NetworkWorker<B: BlockT + 'static, H: ExHashT> {
 	/// Requests started using [`NetworkService::request`]. Includes the channel to send back the
 	/// response, when the request has started, and the name of the protocol for diagnostic
 	/// purposes.
-	pending_requests: HashMap<
-		behaviour::RequestId,
-		(oneshot::Sender<Result<Vec<u8>, RequestFailure>>, Instant, String)
-	>,
+	pending_requests: HashMap<behaviour::RequestId, (oneshot::Sender<RequestResult>, Instant, String)>
 }
 
 struct Metrics {
@@ -1271,12 +1284,15 @@ impl<B: BlockT + 'static, H: ExHashT> Future for NetworkWorker<B, H> {
 						},
 						Err(behaviour::SendRequestError::NotConnected) => {
 							let err = RequestFailure::Network(OutboundFailure::ConnectionClosed);
-							let _ = pending_response.send(Err(err));
+							let _ = pending_response.send(RequestResult::Error(err));
 						},
 						Err(behaviour::SendRequestError::UnknownProtocol) => {
 							let err = RequestFailure::Network(OutboundFailure::UnsupportedProtocols);
-							let _ = pending_response.send(Err(err));
+							let _ = pending_response.send(RequestResult::Error(err));
 						},
+						Err(behaviour::SendRequestError::BackOff(listener, req)) => {
+							let _ = pending_response.send(RequestResult::BackOff(listener, req));
+						}
 					}
 				},
 				ServiceToWorkerMsg::RegisterNotifProtocol { engine_id, protocol_name } => {
@@ -1343,33 +1359,36 @@ impl<B: BlockT + 'static, H: ExHashT> Future for NetworkWorker<B, H> {
 				},
 				Poll::Ready(SwarmEvent::Behaviour(BehaviourOut::RequestFinished { request_id, result })) => {
 					if let Some((send_back, started, protocol)) = this.pending_requests.remove(&request_id) {
-						if let Some(metrics) = this.metrics.as_ref() {
-							match &result {
-								Ok(_) => {
+						match result {
+							Ok(resp) => {
+								if let Some(metrics) = this.metrics.as_ref() {
 									metrics.requests_out_success_total
 										.with_label_values(&[&protocol])
 										.observe(started.elapsed().as_secs_f64());
 								}
-								Err(err) => {
-									let reason = match err {
-										RequestFailure::Refused => "refused",
-										RequestFailure::Network(OutboundFailure::DialFailure) =>
-											"dial-failure",
-										RequestFailure::Network(OutboundFailure::Timeout) =>
-											"timeout",
-										RequestFailure::Network(OutboundFailure::ConnectionClosed) =>
-											"connection-closed",
-										RequestFailure::Network(OutboundFailure::UnsupportedProtocols) =>
-											"unsupported",
-									};
+								let _ = send_back.send(RequestResult::Response(resp));
+							}
+							Err(err) => {
+								let reason = match err {
+									RequestFailure::Refused => "refused",
+									RequestFailure::Network(OutboundFailure::DialFailure) =>
+										"dial-failure",
+									RequestFailure::Network(OutboundFailure::Timeout) =>
+										"timeout",
+									RequestFailure::Network(OutboundFailure::ConnectionClosed) =>
+										"connection-closed",
+									RequestFailure::Network(OutboundFailure::UnsupportedProtocols) =>
+										"unsupported",
+								};
 
+								if let Some(metrics) = this.metrics.as_ref() {
 									metrics.requests_out_failure_total
 										.with_label_values(&[&protocol, reason])
 										.inc();
 								}
+								let _ = send_back.send(RequestResult::Error(err));
 							}
 						}
-						let _ = send_back.send(result);
 					} else {
 						error!("Request not in pending_requests");
 					}
